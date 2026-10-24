@@ -550,6 +550,9 @@ struct Glm5Model::FastState {
         std::vector<uint64_t> tick;  // recency (LFU tie-break)
         int spare[gf::kSpares] = {-1, -1, -1};   // the device's spare table, mirrored (slot or -1)
         uint64_t evictions = 0;
+        // main slots whose pool blocks are lent to another program (src/core/glm_lend.cu): kLent, their memory with
+        // the driver until the lease comes back.  (The tail's kLent slots - the prompt path's loan - are not counted.)
+        int n_lent = 0;
     };
     std::vector<LayerPool> lp;   // indexed by absolute layer
     std::vector<int> slot_of;    // il * n_expert + e -> slot in lp[il], -1 absent
@@ -931,6 +934,59 @@ struct Glm5Model::FastState {
         return false;
     }
 };
+
+// ---- lending main-slot pool blocks to another program on the same machine (src/core/glm_lend.cu; the VramLender
+//      over a model's parts is make_glm_lender in glm_model.hpp).  A lent block's slots are kLent: in no table (slot_of,
+//      tab, the spare table), never a spare, a promotion's target or a victim (every slot picker takes kFree or
+//      kResident slots only), and counted in LayerPool::n_lent until the block is mapped back and they are kFree.
+namespace glmfast {
+// one pool block as the lending sees it: the main slots it holds as (layer, count) - one layer, or several where
+// layers of one slot size share the block
+struct LendBlock {
+    int block = 0;
+    std::vector<std::pair<int, int>> spans;
+};
+// The blocks to lend: `want` of `cand` (want < 0: as many as can go), in the order taken - fewer when no more can go.
+// have[l]: layer l's main slots not lent; keep[l]: the fewest it keeps; heat[l]: what each of those slots is worth,
+// ascending (an empty slot 0, a resident 1 + its LFU count).  Taking c slots of a layer costs its c coldest (the
+// lending moves a lent slot's expert over a colder one), so each step takes the block of the least worth a slot whose
+// layers all stay at or above their minimum; on equal worth a block of one layer before a shared one (taking a shared
+// block can leave neither layer room for a whole block of its own), then the block whose layers have the most slots
+// above their minimum (the lending spreads over the layers), then the later block (a region's end).
+std::vector<int> lend_choose(const std::vector<LendBlock>& cand, const std::vector<int>& have,
+                             const std::vector<int>& keep, const std::vector<std::vector<uint64_t>>& heat, int want);
+// What a card can lend, in bytes: the lendable rule (strata::core::lendable_bytes over the pool, the prompt path's
+// borrow and the minimum slots' bytes) capped at the `blocks` whole blocks lend_choose can take.
+size_t lend_capacity(size_t pool_bytes, size_t borrow_bytes, size_t min_bytes, size_t block_bytes, int blocks);
+
+// lend_choose's inputs for one part (layers by absolute index; keep: the slots a layer keeps, the same for each; the
+// candidates: the mapped blocks none of whose slots is lent) and the pool bytes the minimum slots take (a slot's
+// share of its block: block / per_block).  Takes F.mu.
+struct LendView {
+    std::vector<LendBlock> cand;
+    std::vector<int> have, keep;
+    std::vector<std::vector<uint64_t>> heat;
+    size_t min_bytes = 0;
+};
+LendView lend_view(Glm5Model::FastState& F, int l0, int lt, int n_expert, int keep);
+// The main slots of `blocks` (mapped blocks of F.vpool) leave the tables: a resident there moves into an empty slot
+// of its layer outside the set, or over a colder resident (which goes to the RAM tier, or to disk), or itself goes
+// to the RAM tier or to disk; a spare there leaves the spare table; the slots are kLent.  The device tables are
+// updated on F.cs (synchronized).  The caller has quiesced the part (no token in flight, no background move, no
+// demotion draining).  Takes F.mu.
+struct LendCounts {
+    uint64_t moved = 0, parked = 0, dropped = 0;   // experts moved to colder slots, to the RAM tier, to disk
+    int slots = 0;                                  // main slots lent
+};
+bool lend_take(Glm5Model::FastState& F, int l0, int lt, int n_expert, const std::vector<int>& blocks, LendCounts& c,
+               std::string& err);
+// ... then the card is synchronized (cudaDeviceSynchronize on `dev`, the current device) and the blocks unmapped.  On
+// failure the blocks are mapped back where they can be and their slots are free again.
+bool lend_unmap(Glm5Model::FastState& F, int dev, const std::vector<int>& blocks, std::string& err);
+// The slots of `blocks` (mapped again) that are kLent -> kFree: the boundaries refill them.  Takes F.mu.
+void lend_free(Glm5Model::FastState& F, const std::vector<int>& blocks);
+}  // namespace glmfast
+
 
 // KV streaming (Glm5Model::kv_stream_setup): per DSA layer of this part (the NextN block's too), its latent cache in
 // pinned host memory - the authoritative copy, position order - and the residency map of its VRAM slots, which are

@@ -21,6 +21,7 @@
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/glm_dflash.hpp"
+#include "strata/core/vram_lend.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/exl3.hpp"
 #include "strata/kernels/sampler.hpp"
@@ -1086,5 +1087,20 @@ private:
 /// one layer's latent cache (0: not streamed).
 size_t glm_prefill_lend_bytes(const Glm5Geometry& g, size_t T, bool has_kda, bool has_dsa, bool has_dense,
                               bool has_moe, bool mtp, int64_t max_ctx, size_t gstride, size_t kv_stage = 0);
+
+/// The VramLender over a loaded model's expert pools (src/core/glm_lend.cu): every card of its parts, from the head
+/// part (the one load_pack returned; the later parts are its split_next_ chain).  A card lends whole blocks of its
+/// part's main expert slots (the VramPool of fast_setup); several parts on one card lend together.  Construct it once
+/// the model is loaded and keep it, with a LendCommands over it, for the engine's life.
+///
+/// When to call.  lend() and give_back() only from the engine's own command loop (the thread that runs requests),
+/// between scheduler steps, with nothing in flight on any part: no token, verify window or draft issued and not yet
+/// taken, no prompt read (its pool tail lent) and no prompt gap.  One sequence: between requests, where VLEND is taken
+/// now.  Several sequences (STRATA_GLM_SEQS, glm_multi.cu): at the top of the serve loop after the scheduler's drain
+/// (every issued token and window taken back, as before multi_boundary), never from inside prefill_gap.  lend() runs
+/// each part's fast_boundary itself with the background moves held, so no boundary is needed around it; the decode
+/// then goes on with the new tables.  lend_cards() reads under each part's lock and may be called whenever the loop
+/// takes a command line.  None of the three is safe from another thread.
+std::unique_ptr<VramLender> make_glm_lender(Glm5Model& head);
 
 }  // namespace strata::core

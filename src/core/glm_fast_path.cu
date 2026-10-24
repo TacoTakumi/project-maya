@@ -5183,9 +5183,10 @@ bool Glm5Model::fast_boundary(std::string& err) {
             }
             // A full unified pool needs spares only in empty slots (e.g. after
             // prompt lending). Never evict an expert just to reserve a spare.
-            // (A complete pool's main slots hold every expert and the spares: none to find means none is needed.)
-            if (glmfast::full_unified_pool(F->unified_memory, P.n, g.n_expert) ||
-                glmfast::complete_pool(P.n_main, g.n_expert, gf::kSpares))
+            // (A complete pool's main slots hold every expert and the spares: none to find means none is needed - but
+            // not while some of them are lent to another program, glm_lend.cu: their experts left VRAM.)
+            if (glmfast::full_unified_pool(F->unified_memory, P.n - P.n_lent, g.n_expert) ||
+                glmfast::complete_pool(P.n_main - P.n_lent, g.n_expert, gf::kSpares))
                 break;
             // the least recently used resident of this layer goes (the engine's own rule now).  It is kept
             // STRATA_GLM_VRAM_EVICT=least (or 0): the least-used by the aged counts, recency breaking ties - route
