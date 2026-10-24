@@ -1,4 +1,4 @@
-"""serve/test_vram_lend.py - the /vram routes (serve/vram_lend.py): lend a card's expert-cache memory, give it back and
+"""serve/test_vram_lend.py - the /vram routes (serve/vram_lend.py): lend a GPU's expert-cache memory, give it back and
 what is lent, over a stand-in engine that speaks the lend commands (LEND / RETURN / LENDABLE) the way the engines do -
 also while a request runs.
 
@@ -169,8 +169,8 @@ class LendBase(unittest.TestCase):
             with e:
                 return e.code, json.loads(e.read() or b"null")
 
-    def lend(self, card, mib):
-        return self.call("POST", "/vram/lend", {"card": card, "mib": mib})
+    def lend(self, gpu, mib):
+        return self.call("POST", "/vram/lend", {"gpu": gpu, "mib": mib})
 
     def give_back(self, lease_id):
         return self.call("POST", "/vram/return", {"id": lease_id})
@@ -180,8 +180,8 @@ class LendBase(unittest.TestCase):
         self.assertEqual(code, 200, out)
         return out
 
-    def card(self, state, pci):
-        return next(c for c in state["cards"] if c["card"] == pci)
+    def gpu(self, state, pci):
+        return next(c for c in state["gpus"] if c["gpu"] == pci)
 
     def engine_lines(self, word):
         try:
@@ -194,25 +194,32 @@ class Routes(LendBase):
     def test_lend_answers_the_lease(self):
         code, out = self.lend("0000:0a:00.0", 100)
         self.assertEqual(code, 200, out)
-        self.assertEqual(set(out), {"id", "card", "mib"})
+        self.assertEqual(set(out), {"id", "gpu", "mib"})
         self.assertIsInstance(out["id"], str)
-        self.assertEqual((out["card"], out["mib"]), ("0000:0a:00.0", 128))   # (the engine's blocks: rounded up)
+        self.assertEqual((out["gpu"], out["mib"]), ("0000:0a:00.0", 128))   # (the engine's blocks: rounded up)
         self.assertEqual(self.engine_lines("LEND"), ["LEND 1 100"])           # the card's number from its VRAM line
 
-    def test_card_is_matched_without_case(self):
-        for card in ("0000:0A:00.0", "0000:0a:00.0", "00000000:0A:00.0"):
-            code, out = self.lend(card, 64)
-            self.assertEqual(code, 200, (card, out))
-            self.assertEqual(out["card"], "0000:0a:00.0")
+    def test_gpu_is_matched_without_case(self):
+        for gpu in ("0000:0A:00.0", "0000:0a:00.0", "00000000:0A:00.0"):
+            code, out = self.lend(gpu, 64)
+            self.assertEqual(code, 200, (gpu, out))
+            self.assertEqual(out["gpu"], "0000:0a:00.0")
         self.assertEqual(self.engine_lines("LEND"), ["LEND 1 64"] * 3)
 
-    def test_unknown_or_malformed_card_is_400(self):
-        for card in ("0000:09:00.0", "0000:01:00.1", "gpu0", "", 3, None, ["0000:01:00.0"]):
-            code, out = self.lend(card, 64)
-            self.assertEqual(code, 400, (card, out))
+    def test_unknown_or_malformed_gpu_is_400(self):
+        for gpu in ("0000:09:00.0", "0000:01:00.1", "gpu0", "", 3, None, ["0000:01:00.0"]):
+            code, out = self.lend(gpu, 64)
+            self.assertEqual(code, 400, (gpu, out))
             self.assertIn("error", out)
         code, out = self.call("POST", "/vram/lend", {"mib": 64})
         self.assertEqual(code, 400, out)
+        self.assertIn('"gpu"', out["error"])
+        self.assertEqual(self.engine_lines("LEND"), [])
+
+    def test_the_old_card_field_is_400_naming_gpu(self):
+        code, out = self.call("POST", "/vram/lend", {"card": "0000:01:00.0", "mib": 64})
+        self.assertEqual(code, 400, out)
+        self.assertIn('"gpu"', out["error"])
         self.assertEqual(self.engine_lines("LEND"), [])
 
     def test_bad_mib_is_400(self):
@@ -220,7 +227,7 @@ class Routes(LendBase):
             code, out = self.lend("0000:01:00.0", mib)
             self.assertEqual(code, 400, (mib, out))
             self.assertIn("error", out)
-        code, out = self.call("POST", "/vram/lend", {"card": "0000:01:00.0"})
+        code, out = self.call("POST", "/vram/lend", {"gpu": "0000:01:00.0"})
         self.assertEqual(code, 400, out)
         self.assertEqual(self.engine_lines("LEND"), [])
 
@@ -232,13 +239,13 @@ class Routes(LendBase):
             self.assertEqual(code, 400, (raw, out))
 
     def test_over_lendable_is_409_with_the_max(self):
-        lendable = self.card(self.state(), "0000:01:00.0")["lendable"]
+        lendable = self.gpu(self.state(), "0000:01:00.0")["lendable"]
         self.assertEqual(lendable, 4096)
         code, out = self.lend("0000:01:00.0", lendable + 1)
         self.assertEqual((code, out), (409, {"max_mib": lendable}))
         self.assertEqual(self.lend("0000:01:00.0", 1024)[0], 200)
         code, out = self.lend("0000:01:00.0", 4096)
-        self.assertEqual((code, out), (409, {"max_mib": self.card(self.state(), "0000:01:00.0")["lendable"]}))
+        self.assertEqual((code, out), (409, {"max_mib": self.gpu(self.state(), "0000:01:00.0")["lendable"]}))
         self.assertEqual(out["max_mib"], 3072)
 
     def test_a_card_that_does_not_lend_can_give_0(self):
@@ -247,31 +254,31 @@ class Routes(LendBase):
 
     def test_state_shape(self):
         st = self.state()
-        self.assertEqual(st, {"cards": [{"card": "0000:01:00.0", "lendable": 4096, "lent": 0},
-                                        {"card": "0000:0a:00.0", "lendable": 2048, "lent": 0},
-                                        {"card": "0000:0b:00.0", "lendable": 0, "lent": 0}],
+        self.assertEqual(st, {"gpus": [{"gpu": "0000:01:00.0", "lendable": 4096, "lent": 0},
+                                        {"gpu": "0000:0a:00.0", "lendable": 2048, "lent": 0},
+                                        {"gpu": "0000:0b:00.0", "lendable": 0, "lent": 0}],
                               "leases": []})
         code, a = self.lend("0000:01:00.0", 512)
         self.assertEqual(code, 200)
         st = self.state()
-        self.assertEqual(st["leases"], [{"id": a["id"], "card": "0000:01:00.0", "mib": 512}])
-        self.assertEqual(self.card(st, "0000:01:00.0"), {"card": "0000:01:00.0", "lendable": 3584, "lent": 512})
+        self.assertEqual(st["leases"], [{"id": a["id"], "gpu": "0000:01:00.0", "mib": 512}])
+        self.assertEqual(self.gpu(st, "0000:01:00.0"), {"gpu": "0000:01:00.0", "lendable": 3584, "lent": 512})
 
     def test_two_leases_on_one_card_return_independently(self):
         code1, a = self.lend("0000:01:00.0", 256)
         code2, b = self.lend("0000:01:00.0", 512)
         self.assertEqual((code1, code2), (200, 200))
         self.assertNotEqual(a["id"], b["id"])
-        self.assertEqual(self.card(self.state(), "0000:01:00.0")["lent"], 768)
+        self.assertEqual(self.gpu(self.state(), "0000:01:00.0")["lent"], 768)
         code, out = self.give_back(a["id"])
         self.assertEqual(code, 200, out)
-        self.assertEqual(out, {"id": a["id"], "card": "0000:01:00.0", "mib": 256})
+        self.assertEqual(out, {"id": a["id"], "gpu": "0000:01:00.0", "mib": 256})
         st = self.state()
-        self.assertEqual(st["leases"], [{"id": b["id"], "card": "0000:01:00.0", "mib": 512}])
-        self.assertEqual(self.card(st, "0000:01:00.0")["lent"], b["mib"])
+        self.assertEqual(st["leases"], [{"id": b["id"], "gpu": "0000:01:00.0", "mib": 512}])
+        self.assertEqual(self.gpu(st, "0000:01:00.0")["lent"], b["mib"])
         self.assertEqual(self.give_back(b["id"])[0], 200)
         st = self.state()
-        self.assertEqual((st["leases"], self.card(st, "0000:01:00.0")["lent"]), ([], 0))
+        self.assertEqual((st["leases"], self.gpu(st, "0000:01:00.0")["lent"]), ([], 0))
 
     def test_a_numeric_id_is_taken_too(self):
         code, a = self.lend("0000:01:00.0", 64)
@@ -294,7 +301,7 @@ class Routes(LendBase):
         self.assertEqual(code, 404, out)
         self.assertEqual(self.give_back("999")[0], 404)
         self.assertEqual(self.engine_lines("RETURN"), [])
-        self.assertEqual(self.card(self.state(), "0000:01:00.0")["lent"], 64)
+        self.assertEqual(self.gpu(self.state(), "0000:01:00.0")["lent"], 64)
 
     def test_an_id_from_before_a_restart_is_404(self):
         # the new process hands out the engine's ids from the start again: an old id never names its lease
@@ -309,8 +316,8 @@ class Routes(LendBase):
         self.assertEqual(code, 404, out)
         self.assertEqual(self.engine_lines("RETURN"), [])
         st = self.state()
-        self.assertEqual(st["leases"], [{"id": b["id"], "card": "0000:01:00.0", "mib": 128}])
-        self.assertEqual(self.card(st, "0000:01:00.0")["lent"], 128)
+        self.assertEqual(st["leases"], [{"id": b["id"], "gpu": "0000:01:00.0", "mib": 128}])
+        self.assertEqual(self.gpu(st, "0000:01:00.0")["lent"], 128)
         self.assertEqual(self.give_back(b["id"])[0], 200)
         self.assertEqual(self.engine_lines("RETURN"), ["RETURN 7"])   # (the new process's own id for it)
         self.assertEqual(self.state()["leases"], [])
@@ -329,7 +336,7 @@ class Routes(LendBase):
         self.engine.restart()
         st = self.state()
         self.assertEqual(st["leases"], [])
-        self.assertEqual([c["lent"] for c in st["cards"]], [0, 0, 0])
+        self.assertEqual([c["lent"] for c in st["gpus"]], [0, 0, 0])
 
     def test_engine_not_running(self):
         code, a = self.lend("0000:01:00.0", 64)
@@ -337,7 +344,7 @@ class Routes(LendBase):
         self.engine.proc.wait()
         st = self.state()
         self.assertEqual(st["leases"], [])
-        self.assertEqual([(c["lendable"], c["lent"]) for c in st["cards"]], [(0, 0)] * 3)
+        self.assertEqual([(c["lendable"], c["lent"]) for c in st["gpus"]], [(0, 0)] * 3)
         code, out = self.lend("0000:01:00.0", 64)
         self.assertEqual(code, 503, out)
         self.assertEqual(self.give_back(a["id"])[0], 404)         # (it ended with the engine)
@@ -345,7 +352,7 @@ class Routes(LendBase):
     def test_no_other_routes(self):
         self.assertEqual(self.call("GET", "/vram/lend")[0], 404)
         self.assertEqual(self.call("POST", "/vram/state", {})[0], 404)
-        self.assertEqual(self.call("POST", "/be" + "rth/lend", {"card": "0000:01:00.0", "mib": 64})[0], 404)
+        self.assertEqual(self.call("POST", "/be" + "rth/lend", {"gpu": "0000:01:00.0", "mib": 64})[0], 404)
 
 
 class Busy(LendBase):
@@ -359,8 +366,8 @@ class Busy(LendBase):
         self.assertIs(out.get("retry"), True)
         self.assertIn("error", out)
         st = self.state()
-        self.assertEqual(st["leases"], [{"id": a["id"], "card": "0000:01:00.0", "mib": 128}])
-        self.assertEqual(self.card(st, "0000:01:00.0")["lent"], 128)
+        self.assertEqual(st["leases"], [{"id": a["id"], "gpu": "0000:01:00.0", "mib": 128}])
+        self.assertEqual(self.gpu(st, "0000:01:00.0")["lent"], 128)
         code, out = self.give_back(a["id"])
         self.assertEqual(code, 200, out)
         self.assertEqual(self.state()["leases"], [])
@@ -393,15 +400,15 @@ class LateAnswers(LendBase):
         self.assertIn("give it back", out["error"])
         st = self.given_back()
         self.assertEqual(self.engine_lines("RETURN"), ["RETURN 7"])
-        self.assertEqual([c["lent"] for c in st["cards"]], [0, 0, 0])
-        self.assertEqual(self.card(st, "0000:01:00.0")["lendable"], 4096)
+        self.assertEqual([c["lent"] for c in st["gpus"]], [0, 0, 0])
+        self.assertEqual(self.gpu(st, "0000:01:00.0")["lendable"], 4096)
 
     def test_retry_after_a_late_lend_holds_one_lease(self):
         self.assertEqual(self.lend("0000:01:00.0", 64)[0], 503)
         self.svc.vram_lend.answer_s = 10
         code, b = self.lend("0000:01:00.0", 128)
         self.assertEqual(code, 200, b)
-        self.assertEqual((b["card"], b["mib"]), ("0000:01:00.0", 128))
+        self.assertEqual((b["gpu"], b["mib"]), ("0000:01:00.0", 128))
         self.assertNotEqual(b["id"], "7")
         end = time.monotonic() + 10
         while time.monotonic() < end:
@@ -411,18 +418,18 @@ class LateAnswers(LendBase):
             time.sleep(0.05)
         self.assertEqual(self.engine_lines("RETURN"), ["RETURN 7"])       # the late one, not the retry's
         self.assertEqual(st["leases"], [b])
-        self.assertEqual(self.card(st, "0000:01:00.0")["lent"], 128)
+        self.assertEqual(self.gpu(st, "0000:01:00.0")["lent"], 128)
 
     def test_state_after_a_late_lend_reads_the_engine(self):
         self.assertEqual(self.lend("0000:01:00.0", 64)[0], 503)
         self.svc.vram_lend.answer_s = 10
         st = self.state()
-        self.assertEqual(self.card(st, "0000:0a:00.0"), {"card": "0000:0a:00.0", "lendable": 2048, "lent": 0})
-        first = self.card(st, "0000:01:00.0")
+        self.assertEqual(self.gpu(st, "0000:0a:00.0"), {"gpu": "0000:0a:00.0", "lendable": 2048, "lent": 0})
+        first = self.gpu(st, "0000:01:00.0")
         self.assertEqual(first["lendable"] + first["lent"], 4096)
         self.assertEqual(sum(x["mib"] for x in st["leases"]), first["lent"])   # listed while the engine lends it
         st = self.given_back()
-        self.assertEqual(self.card(st, "0000:01:00.0"), {"card": "0000:01:00.0", "lendable": 4096, "lent": 0})
+        self.assertEqual(self.gpu(st, "0000:01:00.0"), {"gpu": "0000:01:00.0", "lendable": 4096, "lent": 0})
 
 
 class WhileRequestsRun(LendBase):
@@ -450,7 +457,7 @@ class WhileRequestsRun(LendBase):
             code, out = self.lend("0000:01:00.0", 99999)
             self.assertEqual(code, 409, out)
             st = self.state()
-            self.assertEqual(st["leases"], [{"id": a["id"], "card": "0000:01:00.0", "mib": 64}])
+            self.assertEqual(st["leases"], [{"id": a["id"], "gpu": "0000:01:00.0", "mib": 64}])
             self.assertEqual(self.give_back(a["id"])[0], 200)
             self.assertEqual(self.give_back(a["id"])[0], 404)
             self.assertLess(time.monotonic() - t0, 1.5)
@@ -480,9 +487,9 @@ class Unsupported(LendBase):
         self.assertEqual(code, 501, out)
         self.assertIn("error", out)
         self.assertEqual(self.give_back("7")[0], 501)
-        self.assertEqual(self.state(), {"cards": [{"card": "0000:01:00.0", "lendable": 0, "lent": 0},
-                                                  {"card": "0000:0a:00.0", "lendable": 0, "lent": 0},
-                                                  {"card": "0000:0b:00.0", "lendable": 0, "lent": 0}],
+        self.assertEqual(self.state(), {"gpus": [{"gpu": "0000:01:00.0", "lendable": 0, "lent": 0},
+                                                  {"gpu": "0000:0a:00.0", "lendable": 0, "lent": 0},
+                                                  {"gpu": "0000:0b:00.0", "lendable": 0, "lent": 0}],
                                         "leases": []})
         # the engine's ERR lines for a request are still the request's
         ids = [1, 2, 3]
@@ -506,8 +513,8 @@ class NotAMayaEngine(unittest.TestCase):
                 except urllib.error.HTTPError as e:
                     with e:
                         return e.code, json.loads(e.read())
-            self.assertEqual(call("GET", "/vram/state"), (200, {"cards": [], "leases": []}))
-            self.assertEqual(call("POST", "/vram/lend", {"card": "0000:01:00.0", "mib": 64})[0], 501)
+            self.assertEqual(call("GET", "/vram/state"), (200, {"gpus": [], "leases": []}))
+            self.assertEqual(call("POST", "/vram/lend", {"gpu": "0000:01:00.0", "mib": 64})[0], 501)
             self.assertEqual(call("POST", "/vram/return", {"id": "7"})[0], 501)
         finally:
             httpd.shutdown()
@@ -537,6 +544,14 @@ class SourceScan(unittest.TestCase):
         for name in ("server.py", "vram_lend.py"):
             text = (ROOT / "serve" / name).read_text(encoding="utf-8")
             self.assertNotIn(word, text.lower(), name)
+
+    def test_vram_json_names_no_card(self):
+        # the /vram JSON names a GPU "gpu" (and the list "gpus"): no "card" key in a dict literal or a lookup
+        import re
+        key = re.compile(r"""["']cards?["']\s*:|\[\s*["']cards?["']\s*\]|\.get\(\s*["']cards?["']""")
+        for name in ("vram_lend.py", "server.py"):
+            text = (ROOT / "serve" / name).read_text(encoding="utf-8")
+            self.assertEqual(key.findall(text), [], name)
 
 
 if __name__ == "__main__":
