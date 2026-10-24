@@ -1016,6 +1016,9 @@ public:
     static PoolBudget pool_budget(size_t free_b, size_t total_b, int part, size_t floor_b, size_t slot_b,
                                   bool unified = false);
     PoolBudget part_budget(size_t free_b, size_t total_b, size_t floor_b, size_t slot_b) const;   // ... less pool_short_
+    // the main slots' pool (glm_fast_path.cu) holds whole slots in blocks: {share, rounding} - of B bytes of it, at
+    // least (B - rounding) * share are slots; the budget's slot bytes are figured from that
+    std::pair<double, size_t> pool_fit() const;
     void pool_check(size_t floor_b, size_t slot_b, size_t all_b);   // auto: the budget written once, free VRAM read again
     size_t pool_short_ = 0;                                // what that check found short of the reserve
     size_t commit_kept_ = 0, commit_limit_ = 0, commit_ram_ = 0;   // (a Windows APU: what the commit kept off, as read)
