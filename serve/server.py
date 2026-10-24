@@ -56,7 +56,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve import ds4_vision, gpu_map, hy4_vision, loop_guard, mm3_vision, model_api, model_pull, models, savings  # noqa: E402
+from serve import ds4_vision, gpu_map, hy4_vision, loop_guard, mm3_vision, model_api, model_pull, models, savings, vram_lend  # noqa: E402
 from serve import attach, mixed_gpus  # noqa: E402
 from serve import glm_link  # noqa: E402  GLM on an AMD APU + an NVIDIA card ("mixed_gpus")
 
@@ -1049,7 +1049,9 @@ class StrataEngine:
             self._context_cost(log_start)
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
         self.lines: queue.Queue = queue.Queue()
-        threading.Thread(target=self._pump, args=(self.proc, self.lines), daemon=True).start()
+        self._lend_lines: queue.Queue = queue.Queue()   # the answers to the lend commands (lend_command)
+        self._lend_lock = threading.Lock()
+        threading.Thread(target=self._pump, args=(self.proc, self.lines, self._lend_lines), daemon=True).start()
 
     def _context_cost(self, offset: int):
         """What this start's context costs in VRAM, from the GLM engine's own start lines ("CUDA0 VRAM before the
@@ -1094,13 +1096,14 @@ class StrataEngine:
         self.ended = True
         wait_gpu_release(self.proc.pid)
 
-    def _pump(self, proc=None, lines=None):
-        # This start's process and line queue: a later start (restart) has its own.  An engine's output can close
+    def _pump(self, proc=None, lines=None, lend_lines=None):
+        # This start's process and line queues: a later start (restart) has its own.  An engine's output can close
         # well after a new one started - GLM's link mode: the AMD GPU's helper program shares the lead's output and
         # ends a little after it - and that late end must not mark the NEW engine ended (every request then started
         # the engine again, about a minute each)
         proc = proc if proc is not None else self.proc
         lines = lines if lines is not None else self.lines
+        lend_lines = lend_lines if lend_lines is not None else self._lend_lines
         for line in proc.stdout:
             if proc is not self.proc:                   # replaced: what is left of its output is nobody's
                 continue
@@ -1116,6 +1119,9 @@ class StrataEngine:
                 self.end_reason = m.group(1).strip() if m else ""
                 self.ended = True
                 continue
+            if vram_lend.is_answer(line):               # (they come while requests run: never a request's lines)
+                lend_lines.put(line)
+                continue
             if self.multi and self._route(line):
                 continue
             lines.put(line)
@@ -1123,6 +1129,7 @@ class StrataEngine:
             return
         self.ended = True                               # its output closed: it is gone, even before the OS says so
         lines.put(None)
+        lend_lines.put(None)
         with self._routes_lock:
             for q in self._routes.values():
                 q.put(None)
@@ -1673,6 +1680,36 @@ class StrataEngine:
                 return got.strip()
             if got.startswith("ERR"):
                 raise ValueError(got[4:].strip())
+
+    def lend_command(self, line: str, timeout: float = 30.0) -> list[str]:
+        """A lend command (LEND / RETURN / LENDABLE, serve/vram_lend.py) -> its answer lines, also while requests run:
+        the engine takes them between its steps, and the answers come back on their own queue (_pump), so neither the
+        service's FIFO nor a request's lines are involved.  One at a time (the answers carry no request id); ValueError
+        when the engine does not answer in `timeout`."""
+        with self._lend_lock:
+            q = self._lend_lines
+            while True:                                 # an answer that came after its command gave up: not this one's
+                try:
+                    if q.get_nowait() is None:
+                        raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                except queue.Empty:
+                    break
+            try:
+                self.proc.stdin.write(line + "\n")
+                self.proc.stdin.flush()
+            except (OSError, ValueError):
+                raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+            got, end = [], time.monotonic() + timeout
+            while True:
+                try:
+                    a = q.get(timeout=max(0.1, end - time.monotonic()))
+                except queue.Empty:
+                    raise ValueError(f"the engine did not answer {line.split()[0]}") from None
+                if a is None:
+                    raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                got.append(a.strip())
+                if vram_lend.last_line(a):
+                    return got
 
     def wrap(self):
         """The server is stopping: a request still thinking closes its reasoning at the next token and answers."""
@@ -2546,6 +2583,7 @@ class Service:
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.fifo = FairLock()
+        self.vram_lend = vram_lend.Lender()           # the /vram routes (lending the engine's GPU memory)
         self.stopping = False            # the server is ending: a request still queued is refused, not started
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
@@ -6342,6 +6380,9 @@ def make_handler(svc: Service):
                     slots = [{"id": i, "n_ctx": svc.engine.max_context,
                               "is_processing": busy if n_slots == 1 else i < active} for i in range(n_slots)]
                     self._json(200, slots if loaded else [])
+            elif path == "/vram/state":
+                if self._authorized():
+                    self._json(*svc.vram_lend.state(svc.engine))
             elif path == "/v1/status":
                 if self._authorized():
                     self._json(200, svc.v1_status())
@@ -6450,6 +6491,15 @@ def make_handler(svc: Service):
                         self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
                         return
                     self._json(200, svc.savings.report())
+                    return
+                if path in ("/vram/lend", "/vram/return"):  # lend the engine's GPU memory, give it back: not queued
+                    try:
+                        req = json.loads(self._body() or b"{}")
+                    except ValueError:
+                        self._json(400, {"error": "the request body must be a JSON object"})
+                        return
+                    lender = svc.vram_lend
+                    self._json(*(lender.lend if path == "/vram/lend" else lender.give_back)(svc.engine, req))
                     return
                 raw_ = self._body()
                 turn_mark("body")

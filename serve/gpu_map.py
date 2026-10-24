@@ -13,8 +13,8 @@ BYTES = ("total", "free", "weights", "kv", "kv_ram", "act", "drafter", "window",
 
 
 def parse(line: str) -> dict | None:
-    """`VRAM dev=0 pci=0000:01:00.0 total=... layers=0-45` -> {"dev": 0, "pci": "0000:01:00", ..., "layers": [0, 45]};
-    None for a line that is not one."""
+    """`VRAM dev=0 pci=0000:01:00.0 total=... layers=0-45` -> {"dev": 0, "pci": "0000:01:00", "addr": "0000:01:00.0",
+    ..., "layers": [0, 45]} (`addr`: pci_addr, the card the /vram routes name); None for a line that is not one."""
     if not line.startswith("VRAM "):
         return None
     out: dict = {}
@@ -22,6 +22,7 @@ def parse(line: str) -> dict | None:
         k, _, v = kv.partition("=")
         if k == "pci":
             out["pci"] = pci_key(v)
+            out["addr"] = pci_addr(v)
         elif k == "layers":
             a, _, b = v.partition("-")
             out["layers"] = [int(a), int(b)] if a.isdigit() and b.isdigit() else None
@@ -41,6 +42,25 @@ def pci_key(s: str | None) -> str | None:
         return f"{int(f[-3], 16):04x}:{int(f[-2], 16):02x}:{int(f[-1].split('.')[0], 16):02x}"
     except ValueError:
         return None
+
+
+def pci_addr(s) -> str | None:
+    """A card's full PCI address as one spelling, "0000:0a:00.0" (lower case, a 4-digit domain, the function): from
+    CUDA's "0000:0A:00.0", NVML's "00000000:0A:00.0" or lspci's "0a:00.0" (domain 0, and function 0 when it has none),
+    whatever their case; None for anything else."""
+    if not isinstance(s, str):
+        return None
+    f = s.strip().lower().split(":")
+    if not 2 <= len(f) <= 3 or len(f[0]) > 8:
+        return None
+    dev, _, fn = f[-1].partition(".")
+    parts = ([f[0]] if len(f) == 3 else ["0"]) + [f[-2], dev, fn or "0"]
+    if not all(p and len(p) <= 8 and all(c in "0123456789abcdef" for c in p) for p in parts):
+        return None
+    d, b, v, n = (int(p, 16) for p in parts)
+    if d > 0xFFFF or b > 0xFF or v > 0x1F or n > 7:
+        return None
+    return f"{d:04x}:{b:02x}:{v:02x}.{n:x}"
 
 
 def merge(lines: list[dict]) -> list[dict]:
