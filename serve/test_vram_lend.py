@@ -430,10 +430,10 @@ class Answers(unittest.TestCase):
                      "ERR MAX 4096\n", "ERR NODEV 3\n", "ERR BUSY 7\n", "ERR UNKNOWN x9\n",
                      "ERR MALFORMED LEND <dev> <mib>\n", "ERR MALFORMED RETURN <id>\n", "ERR MALFORMED LENDABLE\n",
                      "ERR unsupported command 'LEND' (GEN, GENI, STOP and QUIT)\n",
-                     "ERR unsupported command 'LENDABLE' (GEN, GENI, LOGP, VLEND, VRECLAIM, STOP and QUIT)\n"):
+                     "ERR unsupported command 'LENDABLE' (GEN, GENI, LOGP, STOP and QUIT)\n"):
             self.assertTrue(vram_lend.is_answer(line), line)
-        for line in ("T 5\n", "DONE 3 3 1.0 1.0 length\n", "ERR non-finite\n", "ERR 3 non-finite\n", "VLENT 123\n",
-                     "ERR unsupported command 'VLEND' (GEN, GENI, STOP and QUIT)\n", "ENDED\n",
+        for line in ("T 5\n", "DONE 3 3 1.0 1.0 length\n", "ERR non-finite\n", "ERR 3 non-finite\n", "RELENT 123\n",
+                     "ERR unsupported command 'LOGP' (GEN, GENI, STOP and QUIT)\n", "ENDED\n",
                      "ERR malformed GEN line\n", "ERR 4 all 2 conversation states are busy\n"):
             self.assertFalse(vram_lend.is_answer(line), line)
 
