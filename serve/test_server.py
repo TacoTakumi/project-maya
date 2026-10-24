@@ -313,6 +313,156 @@ class ImageMarkers(unittest.TestCase):
             svc.embeddings.path.unlink(missing_ok=True)
 
 
+class OnDemandVisionBase(unittest.TestCase):
+    """The on-demand GLM encoder borrows its size on the engine's first card through the /vram leases before it starts
+    and gives the lease back when it ends: /vram/state lists the lease while the encoder runs and none after.  A
+    stand-in engine that speaks the lend commands (serve/test_vram_lend.py's) and a stand-in encoder."""
+
+    # the stand-in maya-vision: READY, then each ENC waits for the go file (FAKE_ENC_GO, when set) and writes 3 rows
+    ENCODER = r'''
+import os, sys, time
+with open(os.environ["FAKE_ENC_STARTED"], "a") as fh:
+    fh.write(" ".join(sys.argv[1:]) + "\n")
+print("READY", flush=True)
+for line in sys.stdin:
+    f = line.split()
+    if not f or f[0] == "QUIT":
+        break
+    if f[0] == "ENC":
+        go, end = os.environ.get("FAKE_ENC_GO"), time.time() + 20
+        while go and not os.path.exists(go) and time.time() < end:
+            time.sleep(0.02)
+        with open(f[2], "wb") as fh:
+            fh.write(b"rows")
+        print("OK 3", flush=True)
+'''
+    MIB = 1000                                           # the encoder's footprint: the stand-in lends 1024 (64 MiB blocks)
+    env: dict = {}
+
+    def setUp(self):
+        import tempfile
+        from serve.server import Vision
+        from serve.test_vram_lend import stand_in
+        self.dir = tempfile.TemporaryDirectory()
+        d = Path(self.dir.name)
+        self.log, self.started, self.go = d / "lines.log", d / "started.log", d / "go"
+        self.engine = StrataEngine(stand_in(d), [], env=dict(os.environ, FAKE_LOG=str(self.log), **self.env))
+        enc = d / "maya-vision"
+        enc.write_text(f"#!{sys.executable}\n" + self.ENCODER)
+        enc.chmod(0o755)
+        self.picture = d / "x.png"
+        self.picture.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\0" * 32)
+        self.vision = Vision({"exe": str(enc), "mmproj": "m.gguf", "model": "v.gguf", "gpu": True},
+                             env=dict(os.environ, FAKE_ENC_STARTED=str(self.started), FAKE_ENC_GO=str(self.go)),
+                             start=False)
+        tok = ByteTokenizer()
+        self.svc = Service(self.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), vision=self.vision)
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        import shutil
+        self.vision.close()
+        shutil.rmtree(self.vision.dir, ignore_errors=True)   # (its embeddings files)
+        if self.engine.alive():
+            self.engine.close()
+        self.dir.cleanup()
+
+    def wire(self, mib=None):
+        from serve.server import wire_vision_lend
+        wire_vision_lend(self.vision, self.svc, mib or self.MIB)
+
+    def state(self):
+        with urllib.request.urlopen(self.base + "/vram/state", timeout=30) as r:
+            return json.loads(r.read())
+
+    def prepare(self):
+        msgs = [{"role": "user", "content": [{"type": "text", "text": "what does it say"},
+                                             {"type": "image", "source": str(self.picture)}]}]
+        return self.svc.prepare(msgs, None, {})
+
+    def engine_lines(self):
+        try:
+            return [x.strip() for x in self.log.read_text().splitlines()]
+        except OSError:
+            return []
+
+
+class OnDemandVision(OnDemandVisionBase):
+    def test_vision_lease_on_the_first_card_while_it_encodes(self):
+        self.wire()
+        got, failed = [], []
+
+        def run():
+            try:
+                got.append(self.prepare())
+            except Exception as e:  # noqa: BLE001 - shown by the assertion below
+                failed.append(e)
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        during, end = None, time.time() + 20
+        while time.time() < end:                         # polled the way the live smoke test does
+            s = self.state()
+            if s["leases"]:
+                during = s
+                break
+            time.sleep(0.05)
+        self.go.write_text("go")
+        t.join(timeout=30)
+        self.assertFalse(failed, failed)
+        self.assertIsNotNone(during, "no lease while the encoder ran")
+        lease = during["leases"][0]
+        self.assertEqual(len(during["leases"]), 1)
+        self.assertEqual((lease["card"], lease["mib"]), ("0000:01:00.0", 1024))   # the engine's dev 0
+        self.assertEqual(next(c for c in during["cards"] if c["card"] == "0000:01:00.0")["lent"], 1024)
+        after = self.state()
+        self.assertEqual(after["leases"], [])
+        self.assertTrue(all(c["lent"] == 0 for c in after["cards"]), after)
+        self.assertIsNone(self.vision.proc)                # the encoder ended with the request's pictures
+        self.assertFalse(self.vision.owed)
+        lines = self.engine_lines()
+        self.assertIn(f"LEND 0 {self.MIB}", lines)
+        self.assertIn(f"RETURN {lease['id']}", lines)
+        self.assertFalse([x for x in lines if x.split()[0] in ("VLEND", "VRECLAIM")], lines)
+        self.assertIn("--no-warmup", self.started.read_text())
+        ids = got[0][0]
+        self.assertEqual(ids.count(self.svc.tok.encode("<|image_pad|>", parse_special=True)[0]), 3)
+
+    def test_vision_refused_lend_reads_no_picture(self):
+        # more than the first card can lend: the encoder does not start and the request gets the reason
+        self.wire(5000)
+        self.go.write_text("go")
+        with self.assertRaises(ValueError) as cm:
+            self.prepare()
+        self.assertIn("4096 MiB", str(cm.exception))
+        self.assertFalse(self.started.exists())
+        self.assertIsNone(self.vision.proc)
+        self.assertEqual(self.state()["leases"], [])
+        self.assertFalse(self.vision.owed)
+
+    def test_vision_settings_name_no_engine_side_lend(self):
+        # the engine's own vision lend (its VLEND / VRECLAIM and the size in its environment) is not used any more
+        src = (ROOT / "serve/server.py").read_text(encoding="utf-8")
+        self.assertEqual([w for w in ("VLEND", "VRECLAIM", "STRATA_GLM_VISION_LEND_MB") if w in src], [])
+
+
+class OnDemandVisionBusyReturn(OnDemandVisionBase):
+    """The encoder's memory is not free at once after it ends: the return is tried again until the engine takes it."""
+    env = {"FAKE_BUSY": "2"}
+
+    def test_vision_return_retried_while_busy(self):
+        self.wire()
+        self.go.write_text("go")
+        self.prepare()
+        returns = [x for x in self.engine_lines() if x.startswith("RETURN ")]
+        self.assertEqual(len(returns), 3)                  # two ERR BUSY, then RETURNED
+        self.assertEqual(self.state()["leases"], [])
+        self.assertFalse(self.vision.owed)
+
+
 class GlmThinkingLevels(unittest.TestCase):
     """GLM-5.x's template knows reasoning_effort low / high and is "Max" otherwise (no effort given included), and it
     always opens <think>: the server's levels map onto low / high / max, and thinking off closes the think block."""

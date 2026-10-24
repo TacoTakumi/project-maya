@@ -1429,27 +1429,6 @@ class StrataEngine:
             else:
                 return                                  # (not this request's end: dropped, as before)
 
-    def command(self, line: str, expect: str, timeout: float = 60.0) -> str:
-        """One control line between requests (the GLM engine's VLEND / VRECLAIM) -> its answer line; ValueError on
-        the engine's ERR or no answer.  The caller holds the service's FIFO, so no request is reading the lines."""
-        try:
-            self.proc.stdin.write(line + "\n")
-            self.proc.stdin.flush()
-        except OSError:
-            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
-        end = time.time() + timeout
-        while True:
-            try:
-                got = self.lines.get(timeout=max(0.1, end - time.time()))
-            except queue.Empty:
-                raise ValueError(f"the engine did not answer {line.split()[0]}") from None
-            if got is None:
-                raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
-            if got.startswith(expect):
-                return got.strip()
-            if got.startswith("ERR"):
-                raise ValueError(got[4:].strip())
-
     def lend_command(self, line: str, timeout: float = 30.0) -> list[str]:
         """A lend command (LEND / RETURN / LENDABLE, serve/vram_lend.py) -> its answer lines, also while requests run:
         the engine takes them between its steps, and the answers come back on their own queue (_pump), so neither the
@@ -1668,11 +1647,11 @@ class Vision:
     are cached by the source's hash, so a conversation that sends the same picture again (every turn, with most
     clients) encodes it once.
 
-    On demand (start=False, `lend`/`reclaim` set - the GLM engine's VLEND / VRECLAIM): no process until a picture
-    needs encoding; the engine first empties the tail of its expert cache on the first GPU and frees it, the encoder
-    starts in that memory, and once the request's pictures are encoded (`active()`) it ends and the engine takes the
-    memory back.  The decode keeps the whole cache between pictures (~18% faster on Mercury than with the encoder
-    resident), for a second or two of start-up per request with new pictures."""
+    On demand (start=False, `lend`/`reclaim` set by wire_vision_lend): no process until a picture needs encoding;
+    the engine first lends the encoder's size of its expert cache on the first GPU (a lease, as POST /vram/lend
+    takes one: /vram/state lists it), the encoder starts in that memory, and once the request's pictures are encoded
+    (`active()`) it ends and the lease goes back.  The decode keeps the whole cache between pictures (~18% faster on
+    Mercury than with the encoder resident), for a second or two of start-up per request with new pictures."""
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None, start: bool = True):
         args = [cfg["exe"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]]
@@ -1687,8 +1666,9 @@ class Vision:
         self.args, self.log, self.env = args, log, env
         self.dir = Path(tempfile.mkdtemp(prefix="maya-vision-"))
         self.proc = None
-        self.lend = self.reclaim = None   # on demand: callables (the engine's VLEND / VRECLAIM), wired by main()
-        self.owed = False                 # the engine's memory is not back yet (a reclaim that kept failing)
+        # on demand: lend() -> a lease id (ValueError: refused), reclaim(id) -> True once the lease is back
+        self.lend = self.reclaim = None
+        self.lease = None                 # the open lease the encoder runs in (or ran in: a return that kept failing)
         self.lock = threading.RLock()
         self.cache: dict[str, tuple[Path, int]] = {}
         if start:
@@ -1696,8 +1676,9 @@ class Vision:
 
     def _start(self):
         if self.lend is not None:
-            self.settle()
-            self.lend()
+            # a lease an earlier encode could not give back is still lent to the encoder: this one starts in it
+            if self.settle():
+                self.lease = self.lend()
         try:
             self.proc = subprocess.Popen(self.args + (["--no-warmup"] if self.lend is not None else []),
                                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -1720,25 +1701,25 @@ class Vision:
                 self.proc.kill()
                 self.proc.wait()
             self.proc = None
-        if self.reclaim is not None:
-            self.owed = True
+        if self.lease is not None:
             for _ in range(40):          # the driver frees an ended process's memory within moments
                 if self.settle():
                     return
                 time.sleep(0.25)
-            print("[maya] the vision encoder's GPU memory is not back yet: prompts are read token by token until "
-                  "it is", flush=True)
+            print(f"[maya] the vision encoder's GPU memory is not back yet: lease {self.lease} stays lent until it "
+                  "is", flush=True)
+
+    @property
+    def owed(self) -> bool:
+        """The encoder has ended and its lease is still open (the engine did not take the memory back yet)."""
+        return self.lease is not None and self.proc is None
 
     def settle(self) -> bool:
-        """The engine takes back the memory an earlier encode borrowed (true when nothing is owed)."""
-        if not self.owed:
-            return True
-        try:
-            self.reclaim()
-            self.owed = False
-        except ValueError:
-            pass
-        return not self.owed
+        """The lease an earlier encode borrowed goes back to the engine (true when no lease is open)."""
+        with self.lock:
+            if self.lease is not None and self.proc is None and self.reclaim(self.lease):
+                self.lease = None
+            return self.lease is None
 
     @contextlib.contextmanager
     def active(self):
@@ -1897,6 +1878,44 @@ class Vision:
             self.proc.wait(timeout=10)
         except Exception:
             self.proc.kill()
+
+
+def first_card(engine) -> str | None:
+    """The PCI address of the engine's first GPU (its VRAM line dev=0, as the /vram routes name it): the card the
+    on-demand encoder runs on - main() gives the encoder the first of the config's GPUs, which is the engine's CUDA
+    device 0 (CUDA_VISIBLE_DEVICES lists the config's GPUs in its order).  None for an engine without VRAM lines."""
+    return next((r.get("addr") for r in getattr(engine, "vram", None) or [] if r.get("dev") == 0 and r.get("addr")),
+                None)
+
+
+def wire_vision_lend(vision: Vision, svc, mib: int):
+    """The on-demand encoder borrows `mib` MiB on the engine's first GPU through the service's /vram leases (so
+    /vram/state lists it while the encoder runs) and gives the lease back when it ends.  A lend the engine refuses
+    (the card cannot lend that much now, or the engine cannot lend or did not answer) does not start the encoder: the
+    picture request fails with the reason - an encoder started without the memory could run the card out of it in the
+    middle of the model's own work.  A return the engine answers "still in use" (409 retry) is tried again: Vision's
+    _stop for a few seconds, then settle() before the next request; 503 (no answer) likewise.  A lease the engine no
+    longer has (404: it ended or restarted) is back."""
+    def lend() -> str:
+        card = first_card(svc.engine)
+        if card is None:
+            raise ValueError("the model does not report its GPUs, so it cannot lend the vision encoder its memory: the "
+                             "picture cannot be read")
+        code, out = svc.vram_lend.lend(svc.engine, {"card": card, "mib": mib})
+        if code == 200:
+            return out["id"]
+        if code == 409:
+            raise ValueError(f"the model cannot lend the vision encoder {mib} MiB on its first GPU now (it can lend "
+                             f"{out.get('max_mib', 0)} MiB): the picture cannot be read - try again once other "
+                             "programs have given back what they borrowed")
+        raise ValueError(f"the model did not lend the vision encoder its memory ({out.get('error')}): the picture "
+                         "cannot be read")
+
+    def reclaim(lease: str) -> bool:
+        code, _ = svc.vram_lend.give_back(svc.engine, {"id": lease})
+        return code not in (409, 503)
+
+    vision.lend, vision.reclaim = lend, reclaim
 
 
 def vision_footprint(vcfg: dict, env: dict, cache_file: Path, gpu: int) -> tuple[int, int] | None:
@@ -5991,6 +6010,7 @@ def main() -> int:
         import strata_tokenizer as ST
         tok = ST.Tokenizer.from_dir(tpath)              # with the pack's own pre-tokenizer (GLM: glm4, #27)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
+    on_demand_vision = None                             # the GLM encoder that starts in memory the model lends
     if a.engine == "maya":
         if not cfg:
             ap.error("--engine maya needs --config")
@@ -6008,11 +6028,12 @@ def main() -> int:
         venv = dict(env)
         if vcfg and vcfg.get("gpu") and gpu_list(cfg) and cfg.get("backend") not in ("hip", "metal"):
             venv["CUDA_VISIBLE_DEVICES"] = str(gpu_list(cfg)[0])   # the encoder on the first GPU only
-        # the GLM engine lends the encoder the tail of its expert cache while it encodes, sized by what the encoder
-        # measured on this GPU ("resident": true keeps the encoder running beside the model, holding its VRAM)
-        # (Metal: one memory shared with the engine, which answers ERR to VLEND / VRECLAIM: the encoder stays resident)
+        # the GLM engine lends the encoder part of its expert cache on the first GPU while it encodes (a /vram lease),
+        # sized by what the encoder measured on this GPU ("resident": true keeps the encoder running beside the model,
+        # holding its VRAM)
+        # (Metal: one memory shared with the engine, which has no lend: the encoder stays resident)
         on_demand = bool(vcfg) and vcfg.get("gpu") and not vcfg.get("resident") and cfg.get("backend") != "metal"
-        engine_env = env
+        vision_mib = 0
         if on_demand:
             fp = vision_footprint(vcfg, venv, Path(a.config).resolve().with_name("vision-memory.json"),
                                   (gpu_list(cfg) or [0])[0])
@@ -6022,7 +6043,7 @@ def main() -> int:
                 vcfg, on_demand = dict(vcfg, gpu=False), False
             else:
                 vcfg = dict(vcfg, max_tokens=fp[0])
-                engine_env = dict(env, STRATA_GLM_VISION_LEND_MB=str((fp[1] >> 20) + 1))
+                vision_mib = (fp[1] >> 20) + 1
                 print(f"[maya] images: the vision encoder needs {fp[1] / 2**30:.2f} GB on this GPU at up to {fp[0]} "
                       "image tokens", flush=True)
         if vcfg and not on_demand:
@@ -6032,7 +6053,7 @@ def main() -> int:
         if len(gpu_list(cfg)) > 1:
             print(f"[maya] layer split across GPUs {gpu_list(cfg)} ({cfg.get('layer_split') or 'auto'})", flush=True)
         t0 = time.time()
-        engine = StrataEngine(cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env)
+        engine = StrataEngine(cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=env)
         engine.load_s = round(time.time() - t0, 1)      # (the dashboard's estimate of a reload: this start's time)
         warn_tight_ram(engine.info.get("arena_mib"))
         if vision is None and not vcfg and engine.info.get("vision") == "ds4":
@@ -6056,13 +6077,14 @@ def main() -> int:
             print("[maya] images: OFF - pictures are refused until the vision tower loads (see the line above)",
                   flush=True)
         if on_demand:
-            lent = int(engine.info.get("vision_lend") or 0)
-            if lent > 0:
-                vision = Vision(vcfg, log=vlog, env=venv, start=False)
-                vision.lend = lambda: engine.command("VLEND", "VLENT")
-                vision.reclaim = lambda: engine.command("VRECLAIM", "VRECLAIMED")
-                print(f"[maya] images: the vision encoder starts when a picture arrives, in {lent / 2**30:.2f} GB "
-                      "the model lends it", flush=True)
+            # what the first GPU can lend now, with nothing lent yet (LENDABLE; 0 for an engine without lending)
+            card = first_card(engine)
+            _, lendable = vram_lend.Lender().state(engine)
+            room = next((c["lendable"] for c in lendable["cards"] if c["card"] == card), 0) if card else 0
+            if room >= vision_mib:
+                vision = on_demand_vision = Vision(vcfg, log=vlog, env=venv, start=False)   # (wired below, with svc)
+                print(f"[maya] images: the vision encoder starts when a picture arrives, in {vision_mib} MiB the "
+                      f"model lends it on GPU {card} ({room} MiB lendable there now)", flush=True)
             else:   # the model's GPU memory is too small to lend that much (or an engine without lending)
                 print("[maya] images: the model cannot lend the vision encoder its GPU memory here - the encoder "
                       "runs on the CPU", flush=True)
@@ -6081,6 +6103,8 @@ def main() -> int:
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
+    if on_demand_vision is not None:                    # its lease goes through the /vram routes' record
+        wire_vision_lend(on_demand_vision, svc, vision_mib)
     if getattr(engine, "multi", 0) > 1:                 # n conversations at once: n places in the FIFO
         svc.fifo.set_capacity(engine.multi)
         print(f"[maya] {engine.multi} conversations at once (--parallel)", flush=True)
