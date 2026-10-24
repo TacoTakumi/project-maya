@@ -1191,7 +1191,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                 // (every expert's slot as the pool lays it out, so the share below leaves room for all of them)
                 avail = glmfast::expert_pool_budget(true, free_b, (size_t) avail_kb * 1024, reserve,
                                                     (size_t) (head_gb * 1073741824.0),
-                                                    (size_t) ((double) expert_bytes / fit.first) + fit.second);
+                                                    glmfast::pool_bytes_for(expert_bytes, fit.first, fit.second));
                 std::fprintf(stderr, "glm fast: CUDA%d unified memory: MemAvailable %.2f GB, headroom %.2f GB + "
                                      "%zu MB reserve, experts need %.2f GB, pool budget %.2f GB\n", dev_,
                              (double) avail_kb / 1048576.0, head_gb, reserve >> 20,
@@ -1211,7 +1211,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                          dev_, (double) cap / 1073741824.0, (double) used / 1073741824.0, (double) room / 1073741824.0);
             avail = std::min(avail, room);
         }
-        avail = avail > fit.second ? (size_t) ((double) (avail - fit.second) * fit.first) : 0;
+        avail = glmfast::pool_slot_bytes(avail, fit.first, fit.second);
         if (pool_b_.fixed > 0) avail = std::min(avail, (size_t) pool_b_.fixed * stride_max);   // (an APU's too)
         // every layer gets the same number of slots: avail / sum(blob over layers)
         size_t blob_sum = 0;
@@ -6311,20 +6311,7 @@ std::pair<double, size_t> Glm5Model::pool_fit() const {
     size_t gran = 0;
     strata::core::VramPool::vmm_supported(dev_, &gran);
     const strata::core::VramPool::Options o;
-    const size_t smax = *std::max_element(sizes.begin(), sizes.end());
-    const size_t lo = std::max((smax + gran - 1) / gran, (o.min_block_bytes + gran - 1) / gran);
-    const size_t hi = std::max(lo, o.max_block_bytes / gran);
-    double share = 0.0;
-    size_t block = lo * gran;
-    for (size_t m = lo; m <= hi; ++m) {
-        double worst = 1.0;
-        for (size_t s : sizes) worst = std::min(worst, (double) (m * gran / s * s) / (double) (m * gran));
-        if (worst > share) {
-            share = worst;
-            block = m * gran;
-        }
-    }
-    return {share, sizes.size() * block};
+    return glmfast::pool_fit(sizes, gran, o.min_block_bytes, o.max_block_bytes);
 }
 
 // --expert-cache auto: the budget is checked once it is WRITTEN.  Under Windows' WDDM an allocation is resident only

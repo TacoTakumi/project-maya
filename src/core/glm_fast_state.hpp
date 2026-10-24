@@ -30,6 +30,7 @@
 #include <numeric>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #ifdef __linux__
 #include <pthread.h>
@@ -353,6 +354,44 @@ inline size_t expert_stride(size_t blob, int gu_type, int d_type) {
     if (b1 > 0) a = std::lcm(a, b1);
     if (b2 > 0) a = std::lcm(a, b2);
     return (blob + a - 1) / a * a;
+}
+
+// The main slots' pool (strata::core::VramPool) puts whole slots in blocks of one size, a multiple of the granularity
+// in [min_block, max_block] that holds the largest slot.  {share, rounding} for the slot sizes: a pool of B bytes holds
+// at least (B - rounding) * share bytes of slots, for the block size whose worst slot size wastes least
+// (Glm5Model::pool_fit).
+inline std::pair<double, size_t> pool_fit(const std::vector<size_t>& sizes, size_t gran, size_t min_block,
+                                          size_t max_block) {
+    if (sizes.empty() || gran == 0) return {1.0, 0};
+    const size_t smax = *std::max_element(sizes.begin(), sizes.end());
+    const size_t lo = std::max((smax + gran - 1) / gran, (min_block + gran - 1) / gran);
+    const size_t hi = std::max(lo, max_block / gran);
+    double share = 0.0;
+    size_t block = lo * gran;
+    for (size_t m = lo; m <= hi; ++m) {
+        double worst = 1.0;
+        for (size_t s : sizes) worst = std::min(worst, (double) (m * gran / s * s) / (double) (m * gran));
+        if (worst > share) {
+            share = worst;
+            block = m * gran;
+        }
+    }
+    return {share, sizes.size() * block};
+}
+
+// The slot bytes a pool budget of pool_b bytes holds, by pool_fit's {share, rounding}
+inline size_t pool_slot_bytes(size_t pool_b, double share, size_t rounding) {
+    return pool_b > rounding ? (size_t) ((double) (pool_b - rounding) * share) : 0;
+}
+
+// ... and the least budget that holds slot_b bytes of slots (an APU's: every expert).  Truncated both ways, the
+// figure scaled back was often slot_b - 1, and a pool sized for every expert one slot a layer short; so it grows until
+// pool_slot_bytes gives back all of slot_b (a step or two: each adds share, at least half a byte)
+inline size_t pool_bytes_for(size_t slot_b, double share, size_t rounding) {
+    if (share <= 0.0) return slot_b + rounding;
+    size_t b = (size_t) ((double) slot_b / share) + rounding;
+    while (pool_slot_bytes(b, share, rounding) < slot_b) ++b;
+    return b;
 }
 
 // Linux with ZFS: what its ARC holds above its floor (c_min). The ARC gives that memory back under pressure, as the

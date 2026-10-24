@@ -10,6 +10,8 @@
 //    changes nothing;
 //  - the RAM tier's share of a lend (lend_park_budget, STRATA_GLM_LEND_PARK_MB): with a budget of one slot only the
 //    hottest leaving expert is copied to RAM, with none every one goes to disk, the moves the same either way;
+//  - the pool's budget in slot bytes (pool_fit, pool_bytes_for, pool_slot_bytes): a budget sized for every expert
+//    holds every expert once scaled back, for every slot size from 1 to 20 MiB;
 //  - the lender (make_glm_lender) and the lend commands over two such parts behind Glm5Model shells, a split on one
 //    card (and with STRATA_TEST_DEV2=<n> a second run with the second part on card n): each card's lendable, a lend
 //    whose blocks free the card's memory (on one card shared by the parts), a return refused as busy while another
@@ -178,6 +180,37 @@ void test_park_budget() {
               glmfast::lend_park_budget());
     }
     unsetenv("STRATA_GLM_LEND_PARK_MB");
+}
+
+// ---- the pool's budget in slot bytes: a unified-memory budget sized for every expert (pool_bytes_for) holds every
+// expert again once scaled back (pool_slot_bytes), for each slot size the engine makes (16-byte multiples, 1-20 MiB)
+// and the block the pool chooses at a 2 MiB granularity in 16-64 MiB - else the pool is one slot a layer short
+void test_pool_bytes() {
+    const VramPool::Options o;
+    int sizes = 0, bad_sizes = 0, bad = 0;
+    size_t first_bad = 0;
+    for (size_t s = kMiB; s <= 20 * kMiB; s += 16, ++sizes) {
+        const auto fit = glmfast::pool_fit({s}, 2 * kMiB, o.min_block_bytes, o.max_block_bytes);
+        int b = 0;
+        for (int ne : {160, 256, 288})
+            for (int nl : {1, 75, 92}) {
+                const size_t experts = (size_t) ne * nl * s;
+                b += glmfast::pool_slot_bytes(glmfast::pool_bytes_for(experts, fit.first, fit.second), fit.first,
+                                              fit.second) < experts;
+            }
+        if (b > 0 && bad_sizes++ == 0) first_bad = s;
+        bad += b;
+    }
+    CHECK(bad == 0, "%d of %d slot sizes (%d of %d cases) short of every expert, the first %zu bytes", bad_sizes, sizes,
+          bad, sizes * 9, first_bad);
+    // two slot sizes, a budget of another kind: the scaling as before
+    const auto fit = glmfast::pool_fit({3 * kMiB + 4096, 5 * kMiB + 272}, 2 * kMiB, o.min_block_bytes,
+                                       o.max_block_bytes);
+    CHECK(fit.first > 0.9 && fit.first <= 1.0 && fit.second % (2 * kMiB) == 0, "fit %.4f %zu", fit.first, fit.second);
+    CHECK(glmfast::pool_slot_bytes(fit.second, fit.first, fit.second) == 0, "no slots in the rounding");
+    CHECK(glmfast::pool_slot_bytes(fit.second + 1000 * kMiB, fit.first, fit.second) ==
+              (size_t) ((double) (1000 * kMiB) * fit.first),
+          "the general scaling");
 }
 
 // ---- a synthetic part on a real pool
@@ -675,6 +708,7 @@ void test_lender(int da, int db) {
 int main() {
     test_choose();
     test_park_budget();
+    test_pool_bytes();
     int dev = 0, n = 0;
     if (const char* e = std::getenv("STRATA_TEST_DEV")) dev = std::atoi(e);
     if (cudaGetDeviceCount(&n) != cudaSuccess || n <= dev) {
