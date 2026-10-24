@@ -7,6 +7,9 @@
 //    them;
 //  - the slot-table changes: slots out (their experts dropped, off the free list), back (on it when no card lends
 //    them any more); the spare's new slot when a lend takes its own (an empty one, else the coldest expert's);
+//  - a layer's RAM copies (copy mode) across swaps, a failed copy and lend / return / fill rounds (one with the
+//    spare's displaced expert dropped too): every slot a copy's or free, held as before after each round, nothing
+//    left on the file;
 //  - the lender over a real VMM pool on one card (needs a GPU with ~2 GiB free; STRATA_TEST_DEV picks it) and a
 //    made-up cache of four layers (one that cannot lend): a lend frees at least its MiB to the driver, no lent slot is
 //    left in a slot table, the spare, the recent slots and the floor stay, the other slots keep their data; more than
@@ -273,6 +276,146 @@ void test_slots() {
     CHECK(lend::spare_slot(table, heat, ok, e) == 3 && e == -1, "spare: the empty slot 3 (expert %d)", e);
     CHECK(lend::spare_slot(table, heat, std::vector<char>(5, 0), e) == -1, "spare: no slot to go to");
     std::printf("slot tables: ok\n");
+}
+
+// ---- a layer's RAM copies (the CPU lane's experts copied into RAM) across the cache's moves and a lend, no GPU ----
+
+// a layer of a copy-mode cache, as ds4_model.cu's cache_queue / cache_switch / lend_take / lend_put change it: VRAM
+// main slots (expert -> slot), RAM copy slots (expert -> slot) and the free ones (at load the swaps' spare)
+struct CopyLayer {
+    int n_ram = 0;   // RAM slots allocated
+    int held = 0;
+    std::vector<int> slot, ram, free, lent_n, lent_free;
+    std::vector<float> heat;
+    int on_file() const {   // experts the CPU lane reads from the file (neither in VRAM nor copied)
+        int n = 0;
+        for (size_t e = 0; e < slot.size(); ++e) n += slot[e] < 0 && ram[e] < 0;
+        return n;
+    }
+    // every RAM slot a copy's or free, once, and held the copies: none lost
+    bool whole() const {
+        std::vector<int> seen((size_t) n_ram, 0);
+        int copies = 0;
+        for (int s : ram)
+            if (s >= 0) {
+                ++copies;
+                if (s < n_ram) ++seen[(size_t) s];
+            }
+        for (int s : free)
+            if (s >= 0 && s < n_ram) ++seen[(size_t) s];
+        for (int n : seen)
+            if (n != 1) return false;
+        return copies == held;
+    }
+    // a swap: `in` (on the CPU lane) into VRAM in place of `out`, which a copy slot takes when one is free (`got`:
+    // its copy from VRAM made)
+    void swap(int in, int out, bool got = true) {
+        const int took = lend::copy_take(free);
+        lend::copy_land(ram, free, held, in, out, took, got);
+        slot[(size_t) in] = slot[(size_t) out];
+        slot[(size_t) out] = -1;
+    }
+    // a fill: `in` into a slot back from a lend, nothing out
+    void fill(int in) {
+        const int to = lent_free.back();
+        lent_free.pop_back();
+        lend::copy_land(ram, free, held, in, -1, -1, false);
+        slot[(size_t) in] = to;
+    }
+    // the ticks' copies from the file into the free slots beyond the spare: how many
+    int copy_ticks() {
+        int n = 0;
+        for (int e; (e = lend::copy_want(slot, ram, heat, free)) >= 0 && n < 64; ++n) {
+            const int took = lend::copy_take(free);
+            lend::copy_land(ram, free, held, -1, e, took, true);
+        }
+        return n;
+    }
+    void lend(int first, int count) {   // (lend_take: the dropped experts to the file)
+        std::vector<int> dropped;
+        lend::slots_out(slot, lent_n, lent_free, first, count, dropped);
+    }
+    void give_back(int first, int count) { lend::slots_back(lent_n, lent_free, first, count); }
+    int hottest_copied() const {   // a fill's expert: the hottest on the CPU lane with a copy
+        int b = -1;
+        for (int e = 0; e < (int) slot.size(); ++e)
+            if (slot[(size_t) e] < 0 && ram[(size_t) e] >= 0 && (b < 0 || heat[(size_t) e] > heat[(size_t) b])) b = e;
+        return b;
+    }
+};
+
+void test_copies() {
+    // 12 experts: 0-3 in VRAM slots 0-3, 4-11 copied into RAM slots 0-7, RAM slot 8 the swaps' spare
+    CopyLayer c;
+    c.n_ram = 9;
+    c.held = 8;
+    c.slot = {0, 1, 2, 3, -1, -1, -1, -1, -1, -1, -1, -1};
+    c.ram = {-1, -1, -1, -1, 0, 1, 2, 3, 4, 5, 6, 7};
+    c.free = {8};
+    c.lent_n.assign(4, 0);
+    c.heat = {10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0.5f, 0.25f};
+    CHECK(c.whole() && c.on_file() == 0, "at load");
+    // a swap: 4 in, 3 out into the spare; 4's slot the next spare
+    c.heat[4] = 20;
+    c.swap(4, 3);
+    CHECK(c.whole() && c.held == 8 && c.ram[3] >= 0 && c.free.size() == 1 && c.on_file() == 0, "a swap");
+    CHECK(lend::copy_want(c.slot, c.ram, c.heat, c.free) < 0, "only the spare free: no copy from the file");
+    // lend, return and fill, three times: the experts the lend drops read from the file while it lasts, the fills'
+    // slots take them back, nothing lost
+    for (int round = 0; round < 3; ++round) {
+        c.lend(1, 2);
+        CHECK(c.whole() && c.held == 8 && c.on_file() == 2, "round %d: lent, two experts on the file", round);
+        CHECK(c.copy_ticks() == 0, "round %d: the spare stays the swaps'", round);
+        c.give_back(1, 2);
+        while (!c.lent_free.empty()) c.fill(c.hottest_copied());
+        CHECK(c.whole(), "round %d: the fills' slots free, none lost (held %d, %zu free)", round, c.held, c.free.size());
+        CHECK(c.held == 6 && c.free.size() == 3, "round %d: two fills, two copies left RAM (held %d)", round, c.held);
+        CHECK(c.copy_ticks() == 2, "round %d: the dropped experts copied from the file", round);
+        CHECK(c.whole() && c.held == 8 && c.free.size() == 1 && c.on_file() == 0,
+              "round %d: held as before (%d), the spare free, nothing on the file (%d)", round, c.held, c.on_file());
+    }
+    // a swap whose copy from VRAM failed: `out` to the file, both slots free, then copied from the file
+    {
+        int out = -1;
+        for (int e = 0; e < 12 && out < 0; ++e)
+            if (c.slot[(size_t) e] >= 0) out = e;
+        c.swap(c.hottest_copied(), out, false);
+        CHECK(c.whole() && c.held == 7 && c.free.size() == 2 && c.on_file() == 1, "a failed copy: both slots free");
+        CHECK(c.copy_ticks() == 1 && c.whole() && c.held == 8 && c.on_file() == 0, "a failed copy: read back");
+    }
+    // during a lend a dropped expert swapped in (no copy of its own): the expert it moves out takes the spare; the
+    // return's fills free two, one of them the spare again and one for the expert still on the file
+    {
+        c.lend(1, 2);
+        int d = -1, out = -1;
+        for (int e = 0; e < 12; ++e) {
+            if (d < 0 && c.slot[(size_t) e] < 0 && c.ram[(size_t) e] < 0) d = e;
+            if (out < 0 && c.slot[(size_t) e] >= 0) out = e;
+        }
+        c.swap(d, out);
+        CHECK(c.whole() && c.held == 9 && c.free.empty() && c.on_file() == 1, "a dropped expert in: out kept");
+        c.give_back(1, 2);
+        while (!c.lent_free.empty()) c.fill(c.hottest_copied());
+        CHECK(c.copy_ticks() == 1 && c.whole() && c.held == 8 && c.free.size() == 1 && c.on_file() == 0,
+              "after its return: held as before, the spare free (held %d, %zu free)", c.held, c.free.size());
+    }
+    // a lend that takes the VRAM swap spare's block: the spare moves to slot 0, its expert dropped like the block's
+    // (to the file, no copy); the return brings three slots back (the block's two and the spare's old one)
+    {
+        int e0 = -1;
+        for (int e = 0; e < 12 && e0 < 0; ++e)
+            if (c.slot[(size_t) e] == 0) e0 = e;
+        c.slot[(size_t) e0] = -1;
+        c.lend(1, 2);
+        CHECK(c.whole() && c.held == 8 && c.on_file() == 3 && c.copy_ticks() == 0, "the spare's expert dropped too");
+        c.give_back(1, 2);
+        c.lent_free.push_back(0);   // (the spare's old slot, back empty: here slot 0, where the spare was put)
+        while (!c.lent_free.empty()) c.fill(c.hottest_copied());
+        CHECK(c.whole() && c.held == 5 && c.free.size() == 4, "three fills, three slots free (held %d)", c.held);
+        CHECK(c.copy_ticks() == 3 && c.whole() && c.held == 8 && c.free.size() == 1 && c.on_file() == 0,
+              "after its return: held as before (%d), nothing on the file (%d)", c.held, c.on_file());
+    }
+    std::printf("copy slots: ok\n");
 }
 
 // ---- the lender over a real pool and a made-up cache ----
@@ -732,6 +875,7 @@ int main() {
     test_steady();
     test_spare();
     test_slots();
+    test_copies();
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
         std::printf("ds4_lend_test: no GPU, the lender's part skipped\n");
