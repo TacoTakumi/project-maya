@@ -1684,9 +1684,12 @@ struct Model::Impl {
     // streams), switched between windows
     struct Swap {
         int layer = 0, in = -1, out = -1;
-        int ram = -1;   // (copy_mode, `in` held in RAM) the spare slot `out` is copied into from VRAM
+        int ram = -1;   // (copy_mode) the free copy slot `out` is copied into from VRAM, or a copy's `in` from the file
+                        // (-1: none, `out` to the file)
         unsigned win = 0;   // (win_now at the tick that queued it)
         int to = -1;    // a fill: `in` into this slot back from a lend (lent_free) instead of the spare; out -1
+        bool copy = false;      // (copy_mode) no move: `in`, on the CPU lane with no copy, from the file into `ram`
+        bool ram_got = false;   // the copy into `ram` made
     };
     static constexpr int kMaxSwaps = 8;
     // the swap rule: a CPU-lane expert in when its heat passes the coldest VRAM one's x margin + bonus; heat x decay
@@ -1921,7 +1924,7 @@ struct Model::Impl {
     static constexpr int kMaxNH = 4;               // (DS4_COPY_NUMA: up to a part per node of a 4-socket host)
     std::vector<std::array<uint8_t*, kMaxNH>> ram_part;   // slot -> its parts
     std::vector<std::array<size_t, 4>> cp_lay;       // layer -> part offsets of gate, up, down rows; a part's bytes
-    std::vector<int> copy_spare;                      // layer -> its spare slot (-1: none)
+    std::vector<std::vector<int>> copy_free;          // layer -> its free slots (at load the swaps' spare; lend::copy_land)
     // MAYA_DS4_COPY_SWAP=1 (copy mode, opt-in; read as STRATA_DS4_COPY_SWAP, DS4_COPY_SWAP too): the copies follow the routes, as the RAM tier's do. DISK_SKIP_W never computes
     // an expert it leaves out, so its pages never come off the SSD and it is left out wherever it is picked light, all
     // through a conversation; but its heat counts those picks too. A layer's hottest expert read from the files takes
@@ -7785,7 +7788,7 @@ struct Model::Impl {
         bool huge_short = false;   // (the pool ran out: said once)
         double huge_got = 0;       // (the bytes on huge pages)
         std::vector<int> first(L.size(), -1);
-        copy_spare.assign(L.size(), -1);
+        copy_free.assign(L.size(), {});
         cs_free.assign(L.size(), -1);
         for (Layer& l : L) {
             l.ram.assign((size_t) l.n_exp, -1);
@@ -7823,7 +7826,7 @@ struct Model::Impl {
                 for (int X = 0; X < NH; ++X) slot[(size_t) X] = base[(size_t) X] + (size_t) i * part;
                 ram_part.push_back(slot);
             }
-            if (spare_of(l)) copy_spare[(size_t) l.il] = first[(size_t) l.il] + n_copy[(size_t) l.il];
+            if (spare_of(l)) copy_free[(size_t) l.il].push_back(first[(size_t) l.il] + n_copy[(size_t) l.il]);
             if (copy_swap) cs_free[(size_t) l.il] = first[(size_t) l.il] + n_copy[(size_t) l.il] + spare_of(l);
         }
         struct Job {
@@ -11075,7 +11078,8 @@ struct Model::Impl {
 
     // a GGUF's swap: expert sw.in from the file (copy_mode: its copy) into the spare VRAM slot (each member its part);
     // the expert it replaces goes back to the CPU lane, which reads it from the file's mapping - or (copy_mode, sw.ram)
-    // from the layer's spare RAM slot, which it is copied into from VRAM here
+    // from a free RAM slot of the layer, which it is copied into from VRAM here.  (sw.copy: sw.in from the file into
+    // the free RAM slot sw.ram, nothing in VRAM)
     // (the RAM store) expert e's blob out of its store slot when the store holds it (pinned while copied): no read
     bool store_blob(const Layer& l, int e, uint8_t* blob) {
         const int s = store_reads(l, e) ? store->acquire(l.il, e) : -1;
@@ -11087,6 +11091,12 @@ struct Model::Impl {
     void swap_in_mx(Layer& l, Swap& sw, SwapBufs& B) {
         uint8_t *sw_a = B.a, *sw_b = B.b, *sw_h = B.h;   // (this thread's)
         const std::vector<cudaStream_t>& copy_st = B.st;
+        if (sw.copy) {   // (the slot is free: nothing reads it till the switch)
+            sw.ram_got = read_mx_file(l, sw.in, sw_a);
+            if (sw.ram_got) blob_to_ram(l, sw_a, sw.ram);
+            else std::fprintf(stderr, "ds4 cache: layer %d expert %d: the copy into RAM failed\n", l.il, sw.in);
+            return;
+        }
         // (a copy holds its slot till this swap's switch; an in-place one the RAM store holds: from its slot)
         bool ok = copy_mode && !l.ram.empty() && l.ram[(size_t) sw.in] >= 0
                       ? read_mx(l, sw.in, sw_a)
@@ -11113,7 +11123,7 @@ struct Model::Impl {
                 if (got && l.nm > 1) half_to_blob(l, sw_h, m, sw_b);
             }
             if (got) blob_to_ram(l, sw_b, sw.ram);
-            else sw.ram = -1;   // (back to the file's pages then)
+            sw.ram_got = got;   // (else back to the file's pages, the slot free again)
         }
         if (ok && sw.ram < 0 && store_put && store && store->covers(l.il) && !store->has(l.il, sw.out)) {
             // (the RAM store, DS4_STORE_PUT) `out` goes back to the CPU lane, which would read it from the SSD: its blob
@@ -11145,14 +11155,14 @@ struct Model::Impl {
             for (int r = 0; r < 3 && ok; ++r)
                 ok = std::memcmp(dev.data() + l.lay.trellis[r], file.data() + l.lay.trellis[r], mx_part_bytes(l, r)) == 0;
             bool ok_out = true;
-            if (sw.ram >= 0) {
+            if (sw.ram_got) {
                 ok_out = read_mx_file(l, sw.out, file.data());
                 ram_to_blob(l, sw.ram, dev.data());
                 for (int r = 0; r < 3 && ok_out; ++r)
                     ok_out = std::memcmp(dev.data() + l.lay.trellis[r], file.data() + l.lay.trellis[r], mx_part_bytes(l, r)) == 0;
             }
             std::fprintf(stderr, "ds4 cache: layer %d expert %d in, %d out%s: %s\n", l.il, sw.in, sw.out,
-                         sw.ram >= 0 ? " (into RAM)" : "", ok && ok_out ? "matches the model file" : "MISMATCH");
+                         sw.ram_got ? " (into RAM)" : "", ok && ok_out ? "matches the model file" : "MISMATCH");
         } else if (!ok) {
             std::fprintf(stderr, "ds4 cache: layer %d expert %d: the move into VRAM failed\n", l.il, sw.in);
         }
@@ -11281,19 +11291,17 @@ struct Model::Impl {
         }
         for (const Swap& sw : ready) {
             Layer& l = L[(size_t) sw.layer];
+            if (sw.copy) {   // (a copy from the file: RAM only, the tables as they are)
+                lend::copy_land(l.ram, copy_free[(size_t) l.il], ram_held, -1, sw.in, sw.ram, sw.ram_got);
+                l.swap_pending = false;
+                --sw_inflight;
+                continue;
+            }
             const bool fill = sw.to >= 0;   // (a slot back from a lend filled: nothing goes out, the spare stays)
             const int old_slot = fill ? -1 : l.slot[(size_t) sw.out];
             const std::array<uint8_t*, 4> old_parts = l.hh[(size_t) sw.in];
-            if (copy_mode) {   // (`out` takes the RAM place `in` leaves: through the spare, which `in`'s slot becomes)
-                const int s_in = l.ram[(size_t) sw.in];
-                l.ram[(size_t) sw.in] = -1;
-                if (sw.ram >= 0) {
-                    l.ram[(size_t) sw.out] = sw.ram;
-                    copy_spare[(size_t) l.il] = s_in;
-                } else if (s_in >= 0) {   // (the move into RAM failed - `out` back to the file - or a fill: one copy fewer)
-                    --ram_held;
-                    if (copy_spare[(size_t) l.il] < 0) copy_spare[(size_t) l.il] = s_in;
-                }
+            if (copy_mode) {   // (`out` into the slot it took, `in`'s slot free: a fill's too, for a copy from the file)
+                lend::copy_land(l.ram, copy_free[(size_t) l.il], ram_held, sw.in, fill ? -1 : sw.out, sw.ram, sw.ram_got);
             } else if (!l.ram.empty() && l.ram[(size_t) sw.in] >= 0) {   // (in VRAM now: its RAM slot for the next hottest)
                 ram_free.push_back(l.ram[(size_t) sw.in]);
                 l.ram[(size_t) sw.in] = -1;
@@ -11370,8 +11378,8 @@ struct Model::Impl {
                     if (fill) {
                         sw.to = l.lent_free.back();
                         l.lent_free.pop_back();
-                    } else if (copy_mode && l.ram[(size_t) best] >= 0) {
-                        sw.ram = copy_spare[(size_t) l.il];   // (-1: none)
+                    } else if (copy_mode) {
+                        sw.ram = lend::copy_take(copy_free[(size_t) l.il]);   // (-1: none, `out` to the file)
                     }
                     std::lock_guard<std::mutex> lk(sw_mu);
                     sw_queue.push_back(sw);
@@ -11405,6 +11413,21 @@ struct Model::Impl {
                         cs_q.push_back(cs);
                     }
                     cs_cv.notify_one();
+                }
+            }
+            // (not beside DS4_COPY_SWAP: its moves and these could take one expert into two slots)
+            if (copy_mode && !copy_swap && !l.swap_pending && sw_inflight < c_inflight) {   // RAM: a free slot beyond the spare
+                const int ce = lend::copy_want(l.slot, l.ram, l.heat, copy_free[(size_t) l.il]);
+                if (ce >= 0) {   // (a fill or a failed move freed it: the hottest expert the CPU lane reads from the file)
+                    l.swap_pending = true;
+                    ++sw_inflight;
+                    Swap sw{l.il, ce, -1};
+                    sw.win = win_now.load(std::memory_order_relaxed);
+                    sw.copy = true;
+                    sw.ram = lend::copy_take(copy_free[(size_t) l.il]);
+                    std::lock_guard<std::mutex> lk(sw_mu);
+                    sw_queue.push_back(sw);
+                    queued = true;
                 }
             }
             if (l.ram.empty() || ram_free.empty() || ram_inflight >= kMaxSwaps) continue;
@@ -11579,7 +11602,10 @@ struct Model::Impl {
     // card synchronized (cuMemUnmap does not wait for kernels).  The recent slots are never among them
     // (lend::candidates), so rc_pin stays as it is; a layer's swap spare in them moves first to a slot they leave
     // (lend::spare_slot: an empty one, else the coldest expert's, that expert dropped like theirs), so no swap lands in
-    // a lent slot - every such move found before anything changes
+    // a lent slot - every such move found before anything changes.  (copy_mode: an expert dropped, theirs or the
+    // spare's, has no RAM copy - a VRAM one never has - and the RAM no free slot beyond the swaps' copy spare; the
+    // return's fills free the copy slots of the experts they bring in, and the cache copies the dropped ones from the
+    // file into them: lend::copy_want)
     bool lend_take(int di, const std::vector<int>& blocks, std::string& err) {
         const core::VramPool* P = devs[(size_t) di].pool.get();
         if (P == nullptr || lent) {   // (a run of chunks has the tails: lends wait for its end)

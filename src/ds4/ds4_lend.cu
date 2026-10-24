@@ -1,5 +1,6 @@
 // src/ds4/ds4_lend.cu - lending DeepSeek's expert pool to another program (see ds4_model.hpp's lend namespace): the
-// choice of a card's blocks, the slot tables' changes, and the VramLender over a Site (ds4_model.cu's over the model).
+// choice of a card's blocks, the slot tables' changes, a layer's RAM copy slots, and the VramLender over a Site
+// (ds4_model.cu's over the model).
 // Host code only: the pool (core::VramPool) does the driver's part.
 #include "ds4_model.hpp"
 #include "strata/core/vram_pool.hpp"
@@ -161,6 +162,38 @@ int spare_slot(const std::vector<int>& slot, const std::vector<float>& heat, con
         }
     }
     return best;
+}
+
+int copy_take(std::vector<int>& free) {
+    if (free.empty()) return -1;
+    const int s = free.back();
+    free.pop_back();
+    return s;
+}
+
+void copy_land(std::vector<int>& ram, std::vector<int>& free, int& held, int in, int out, int took, bool got) {
+    if (in >= 0 && ram[(size_t) in] >= 0) {   // (in VRAM now: its copy's slot free, for the next move)
+        free.push_back(ram[(size_t) in]);
+        ram[(size_t) in] = -1;
+        --held;
+    }
+    if (took < 0) return;
+    if (got && out >= 0 && ram[(size_t) out] < 0) {
+        ram[(size_t) out] = took;
+        ++held;
+    } else {
+        free.push_back(took);   // (the copy failed: `out` reads the file, the slot is free again)
+    }
+}
+
+int copy_want(const std::vector<int>& slot, const std::vector<int>& ram, const std::vector<float>& heat,
+              const std::vector<int>& free) {
+    if (free.size() < 2) return -1;   // (the last free slot the swaps': a swap's `out` copied from VRAM into it)
+    const size_t n = std::min(slot.size(), std::min(ram.size(), heat.size()));
+    int b = -1;
+    for (size_t e = 0; e < n; ++e)
+        if (slot[e] < 0 && ram[e] < 0 && (b < 0 || heat[e] > heat[(size_t) b])) b = (int) e;
+    return b;
 }
 
 std::vector<core::LendCard> Lender::lend_cards() {
