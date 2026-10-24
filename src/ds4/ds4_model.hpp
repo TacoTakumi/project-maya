@@ -58,7 +58,10 @@ struct Block {
 };
 
 /// The blocks a lend may take: mapped, not foreign, no fixed slot, and not among those that keep each region `keep`
-/// live slots (beyond the fixed ones): a region short of them keeps its hottest blocks.  In block order.
+/// live slots (beyond the fixed ones, counted as slots, an expert in them or not): a region short of them keeps the
+/// blocks that hold the most regions still short, then the most of its own slots, then the lowest index.  So they
+/// follow the layout and the blocks lent, never the heat: a return (its slots empty) or a warmer cache leaves the
+/// count as it was, and a lend of every candidate succeeds.  In block order.
 std::vector<int> candidates(const std::vector<Block>& blocks, int n_regions, int keep);
 /// The lendable rule's inputs over a card's blocks, and its answer (core::lendable_bytes): the pool is the mapped
 /// blocks of the layers that lend, the minimum the blocks of them a lend must leave (`n_cand` of them it may take).
