@@ -5,6 +5,7 @@
 
 #include "strata/core/glm_model.hpp"
 #include "strata/core/remote_experts.hpp"
+#include "strata/core/vram_pool.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/glm_kv_stream.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -514,20 +515,32 @@ struct Glm5Model::FastState {
     //      is being demoted to the RAM tier by a D2H; it becomes free when that copy lands).
     // kLanding: a background promotion's copy is on its way into the slot (fast_boundary step 5)
     enum : char { kFree = 0, kResident = 1, kSpare = 2, kDraining = 3, kLent = 4, kLanding = 5 };
-    // A layer's slots [0, n_main) are at base, [n_main, n) at xbase: every layer's tail lies in ONE region (xpool),
-    // which the prompt path borrows for its buffers while a prompt runs (those slots are kLent then) - and an
-    // on-demand vision encoder while it encodes (the region is freed; xbase is null until it comes back).
+    // A layer's slots [0, n_main) are its region of the expert pool (vpool, region `region`): blocks of `block` bytes
+    // holding per_block slots each, back to back from the block's start, slot 0 at position first_pos of the block at
+    // origin.  So they are origin + i * stride only within a block (run_end); slot_ptr / slot_index go by the blocks.
+    // [n_main, n) are at xbase: every layer's tail lies in ONE region (xpool), which the prompt path borrows for its
+    // buffers while a prompt runs (those slots are kLent then) - and an on-demand vision encoder while it encodes (the
+    // region is freed; xbase is null until it comes back).
     struct LayerPool {
-        uint8_t* base = nullptr;
+        uint8_t* origin = nullptr;
         uint8_t* xbase = nullptr;
-        size_t stride = 0;
+        size_t stride = 0, block = 0;
         int n = 0, n_main = 0;
+        int per_block = 1, first_pos = 0, region = -1;
         uint8_t* slot_ptr(int s) const {
-            return s < n_main ? base + (size_t) s * stride : xbase + (size_t) (s - n_main) * stride;
+            if (s >= n_main) return xbase + (size_t) (s - n_main) * stride;
+            const size_t g = (size_t) first_pos + (size_t) s;
+            return origin + g / (size_t) per_block * block + g % (size_t) per_block * stride;
         }
+        // the end of the main slots from s that lie back to back (the last of s's block + 1, at most n_main)
+        int run_end(int s) const { return std::min(n_main, s + per_block - (first_pos + s) % per_block); }
         int slot_index(unsigned long long p) const {
-            const unsigned long long b0 = (unsigned long long) base, x0 = (unsigned long long) xbase;
-            if (p >= b0 && p < b0 + (unsigned long long) n_main * stride) return (int) ((p - b0) / stride);
+            const unsigned long long o = (unsigned long long) origin, x0 = (unsigned long long) xbase;
+            if (n_main > 0 && p >= o) {
+                const unsigned long long off = p - o, in = off % block;
+                const long long i = (long long) (off / block * (unsigned long long) per_block + in / stride) - first_pos;
+                if (in / stride < (unsigned long long) per_block && i >= 0 && i < n_main) return (int) i;
+            }
             if (xbase != nullptr && p >= x0 && p < x0 + (unsigned long long) (n - n_main) * stride)
                 return n_main + (int) ((p - x0) / stride);
             return -1;
@@ -585,10 +598,11 @@ struct Glm5Model::FastState {
     // the warm-up fills the tiers in its order (this user's experts first)
     std::vector<uint32_t> usage;
     uint64_t cnt_events = 0;
-    uint8_t* pool = nullptr;
-    // the main slots' further allocations, where one did not allocate (each holds whole layers: lp[il].base)
-    std::vector<uint8_t*> pool_more;
-    size_t pool_bytes = 0;
+    // the main slots: one VRAM pool on this card (strata::core::VramPool), a region a layer (lp[il].region; pool_layer:
+    // region -> layer), the layers ordered by slot size.  Addresses are fixed for the pool's life.
+    strata::core::VramPool vpool;
+    std::vector<int> pool_layer;
+    size_t pool_bytes = 0;   // the pool's and the tail's bytes
     int64_t pool_slots = 0;
     // the lendable tail (every layer's slots [n_main, n)) is its own allocation: an on-demand vision encoder can
     // have that memory while it runs (vision_lend frees it, vision_reclaim allocates it again)

@@ -108,8 +108,12 @@ constexpr size_t kMmqSlab = (size_t) 16 << 20;
 // predicted rows an expert is prestaged for (below that it may not be routed at all)
 constexpr int kPreSlots = 160, kPreMinT = 1024, kPreMinRows = 4;
 // resident experts routed by at most kLightRows rows of a chunk take the light kernels (gf::rows_experts) instead of
-// MMQ (STRATA_GLM_PREFILL_LIGHT overrides, 0 = MMQ only); their {slot, r0, nr} ride the bounds array from kLightOff
+// MMQ (STRATA_GLM_PREFILL_LIGHT overrides, 0 = MMQ only); their {slot, r0, nr} ride the bounds array from kLightOff.
+// The slot there is the slot's offset from the layer's first pool block in kLightUnit bytes (the pool's blocks hold
+// whole slots, so a layer's slots are no plain base + slot * stride): the kernels take the block as the base and
+// kLightUnit as the stride
 constexpr int kLightRows = 32, kLightOff = 6144, kLightMax = (8192 - kLightOff) / 3;
+constexpr size_t kLightUnit = 16;
 
 struct KdaBufs {
     float* proj[3];
@@ -1158,7 +1162,10 @@ bool Glm5Model::prefill_setup(std::string& err) {
     // ... less the prompt path's MMQ scratch pool: fast_setup sizes the expert pool without it, so the lendable the
     // chunk below is chosen against must be computed from the same number (mmq_scratch_reserve; 0 with the slab)
     avail -= std::min(avail, mmq_scratch_reserve());
-    int64_t per = std::min<int64_t>(g.n_expert, (int64_t) (avail / std::max<size_t>(1, blob_sum)));
+    // ... in slot bytes, as the pool holds them in its blocks (pool_fit)
+    const auto fit = pool_fit();
+    avail = avail > fit.second ? (size_t) ((double) (avail - fit.second) * fit.first) : 0;
+    int64_t per =std::min<int64_t>(g.n_expert, (int64_t) (avail / std::max<size_t>(1, blob_sum)));
     while (per > 0 && (size_t) per * stride_sum > avail) --per;
     const char* pct_env = getenv("STRATA_PREFILL_LEND_PCT");
     const char* mb_env = getenv("STRATA_GLM_PREFILL_MB");
@@ -2847,7 +2854,13 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         }();
         const auto lt_ok = [](int t) { return t == 16 || t == 18 || t == 19; };
         static const int light_layer = getenv("STRATA_GLM_PREFILL_LIGHT_LAYER") ? std::atoi(getenv("STRATA_GLM_PREFILL_LIGHT_LAYER")) : -1;
-        const int light_rows = lt_ok(Ly.gu_type) && lt_ok(Ly.d_type) && (light_layer < 0 || il == light_layer) ? light_env : 0;
+        // (a light slot's offset in kLightUnit must fit an int: a layer's slots within 32 GiB)
+        const auto light_at = [&](int sl) { return (size_t) (P.slot_ptr(sl) - P.origin) / kLightUnit; };
+        const bool light_fits = P.n_main == 0 || light_at(P.n_main - 1) < (size_t) INT32_MAX;
+        const int light_rows = lt_ok(Ly.gu_type) && lt_ok(Ly.d_type) && (light_layer < 0 || il == light_layer) &&
+                                       light_fits
+                                   ? light_env
+                                   : 0;
         int n_light = 0, rows_mmq = 0;
         int b_pre = -1, rows_pre = 0, max_pre = 0;   // the prestaged set: its bounds, rows and largest expert
         const int pre_n = S->pre_layer == il ? (int) S->pre_e.size() : 0;
@@ -2863,7 +2876,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     cnt = S->h_counts[e];
                     if (cnt > 0 && cnt <= light_rows && n_light < kLightMax) {
                         S->h_counts[e] = -cnt;   // claimed (rows assigned below)
-                        h_light[3 * n_light] = sl;
+                        h_light[3 * n_light] = (int) light_at(sl);
                         h_light[3 * n_light + 1] = e;   // (the expert until its rows are known)
                         h_light[3 * n_light + 2] = cnt;
                         ++n_light;
@@ -3508,10 +3521,19 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             pred_layer = il + 1;
         }
         // the resident experts: the lightly routed ones through the light kernels, the rest in one MMQ product over
-        // the layer's whole pool partition (the light ones empty there), while the copy stream stages
+        // the layer's whole pool partition (the light ones empty there), while the copy stream stages.  The partition's
+        // slots lie back to back only within a pool block: the product goes over each run of them (main_runs; a run
+        // without rows is left out), the bounds the set's from the run's first slot
+        const auto main_runs = [&](const int* hb, const auto& fn) {
+            for (int i0 = 0; i0 < P.n_main;) {
+                const int i1 = P.run_end(i0);
+                if (hb[i1] > hb[i0]) fn(P.slot_ptr(i0), i0, i1 - i0);
+                i0 = i1;
+            }
+        };
         if (n_light > 0) {
             const int o = place(rows_mmq, rows_res - rows_mmq);   // (light rows: at most kLightMax * kLightRows <= W)
-            if (!gf::rows_experts(Ly.gu_type, Ly.d_type, P.base, P.stride, Ly.down_off, M.bounds + kLightOff, n_light,
+            if (!gf::rows_experts(Ly.gu_type, Ly.d_type, P.origin, kLightUnit, Ly.down_off, M.bounds + kLightOff, n_light,
                                   M.row_tok, S->x, T, E, nff, g.swiglu_exp, rows_mmq, rows_res, M.Xq, M.Hq,
                                   M.OUTP + (size_t) (o - rows_mmq) * E, E, s)) {
                 err = "glm prefill: the light expert kernels refused the layer's types";
@@ -3532,7 +3554,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             hb[nbc++] = 0;
             for (int sl = 0; sl < P.n_main; ++sl) {
                 int add = 0;
-                if (li < n_light && h_light[3 * li] == sl) {
+                if (li < n_light && h_light[3 * li] == (int) light_at(sl)) {
                     add = h_light[3 * li + 2];
                     max_l = std::max(max_l, add);
                     ++li;
@@ -3542,7 +3564,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             }
             cudaMemcpy(M.bounds + 4096, hb, (size_t) nbc * sizeof(int), cudaMemcpyHostToDevice);
             w_lo = w_hi = 0;   // (the light rows are re-run over the same window rows: not added twice)
-            run_set(P.base, P.n_main, P.stride, M.bounds + 4096, hb, rows_mmq);
+            main_runs(hb, [&](const uint8_t* w, int i0, int n) {
+                run_set(w, n, P.stride, M.bounds + 4096 + i0, hb + i0, rows_mmq);
+            });
             cudaStreamSynchronize(s);
             cudaMemcpy(B.data(), M.OUTP, B.size() * sizeof(float), cudaMemcpyDeviceToHost);
             double num = 0, den = 0, worst = 0;
@@ -3560,7 +3584,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             std::fprintf(stderr, "glm prefill light check layer %d: %d experts, %d rows, rel L2 %.3e, worst row %.3e\n", il,
                          n_light, nl_rows, std::sqrt(num / std::max(1e-30, den)), worst);
         }
-        run_any(P.base, P.n_main, P.stride, M.bounds + b_res, S->h_bounds + b_res, 0);
+        main_runs(S->h_bounds + b_res, [&](const uint8_t* w, int i0, int n) {
+            run_any(w, n, P.stride, M.bounds + b_res + i0, S->h_bounds + b_res + i0, 0);
+        });
         (void) max_res;
         S->rows_resident += (uint64_t) rows_res;
         if (S->stages) {
