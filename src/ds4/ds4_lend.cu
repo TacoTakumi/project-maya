@@ -40,8 +40,9 @@ std::vector<int> candidates(const std::vector<Block>& blocks, int n_regions, int
     }
     // a region short of its floor keeps open blocks of its live slots until it has it: the one that holds live slots
     // of the most regions still short (one block keeps several floors), then the most of its own, then the lowest
-    // index.  The layout and the blocks lent decide, never the heat or which slots hold an expert: the same blocks stay
-    // whatever the cache holds, and a lend (of candidates only) leaves the choice for the rest as it was
+    // index.  The layout and the blocks lent decide, never the heat, which slots hold an expert or which one is the
+    // swap spare (a slot of the floor like the rest: the cache's swaps move it): the same blocks stay whatever the
+    // cache holds, and a lend (of candidates only) leaves the choice for the rest as it was
     for (int r = 0; r < n_regions; ++r) {
         while (have[(size_t) r] < keep) {
             int best = -1, b_short = 0, b_own = 0;
@@ -137,6 +138,29 @@ void slots_out(std::vector<int>& slot, std::vector<int>& out, std::vector<int>& 
 void slots_back(std::vector<int>& out, std::vector<int>& free, int first, int count) {
     for (int s = first; s < first + count; ++s)
         if (out[(size_t) s] > 0 && --out[(size_t) s] == 0) free.push_back(s);
+}
+
+int spare_slot(const std::vector<int>& slot, const std::vector<float>& heat, const std::vector<char>& ok, int& expert) {
+    std::vector<int> who(ok.size(), -1);   // slot -> its expert
+    for (int e = 0; e < (int) slot.size(); ++e) {
+        const int s = slot[(size_t) e];
+        if (s >= 0 && s < (int) ok.size()) who[(size_t) s] = e;
+    }
+    int best = -1;
+    expert = -1;
+    for (int s = 0; s < (int) ok.size(); ++s) {
+        if (!ok[(size_t) s]) continue;
+        const int e = who[(size_t) s];
+        if (e < 0) {   // (empty: nothing to drop)
+            expert = -1;
+            return s;
+        }
+        if (best < 0 || heat[(size_t) e] < heat[(size_t) expert]) {
+            best = s;
+            expert = e;
+        }
+    }
+    return best;
 }
 
 std::vector<core::LendCard> Lender::lend_cards() {

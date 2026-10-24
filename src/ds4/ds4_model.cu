@@ -11509,8 +11509,9 @@ struct Model::Impl {
             }
         return v;
     }
-    // device di's pool blocks as a lend sees them: a slot's region, whether it is the spare or a recent slot, whether a
-    // lend on another card has it, its expert's heat
+    // device di's pool blocks as a lend sees them: a slot's region, whether it is a recent slot, whether a lend on
+    // another card has it, its expert's heat.  The swap spare is a slot like the rest (lend::kKeep counts it, lend_take
+    // moves it out of the blocks a lend takes): marked, it would fix whichever block the last swap left it in
     void lend_view(int di, std::vector<lend::Block>& out, int& nr) const {
         out.clear();
         nr = 0;
@@ -11541,7 +11542,7 @@ struct Model::Impl {
                     const int e = who[(size_t) sp.region][(size_t) s];
                     lend::Slot x;
                     x.region = sp.region;
-                    x.fixed = s == l.spare_vram || (l.rc_n > 0 && s >= l.rc_base && s < l.rc_base + l.rc_n);
+                    x.fixed = l.rc_n > 0 && s >= l.rc_base && s < l.rc_base + l.rc_n;
                     x.live = l.lent_n.empty() || l.lent_n[(size_t) s] == 0;
                     x.heat = e >= 0 && e < (int) l.heat.size() ? l.heat[(size_t) e] : 0.0f;
                     B.slots.push_back(x);
@@ -11575,8 +11576,10 @@ struct Model::Impl {
     }
     // the slots of device di's pool blocks `blocks` out of the slot tables: each expert in them to the CPU lane, read
     // from the files as one the cache moves out (cache_switch), its table entries 0 on every member's device; then the
-    // card synchronized (cuMemUnmap does not wait for kernels).  The recent slots and the spare are never among them
-    // (lend::candidates), so rc_pin and the swaps' spare stay as they are
+    // card synchronized (cuMemUnmap does not wait for kernels).  The recent slots are never among them
+    // (lend::candidates), so rc_pin stays as it is; a layer's swap spare in them moves first to a slot they leave
+    // (lend::spare_slot: an empty one, else the coldest expert's, that expert dropped like theirs), so no swap lands in
+    // a lent slot - every such move found before anything changes
     bool lend_take(int di, const std::vector<int>& blocks, std::string& err) {
         const core::VramPool* P = devs[(size_t) di].pool.get();
         if (P == nullptr || lent) {   // (a run of chunks has the tails: lends wait for its end)
@@ -11584,7 +11587,57 @@ struct Model::Impl {
             return false;
         }
         const std::vector<std::pair<int, int>> reg = lend_regions(di);
+        std::vector<std::vector<char>> took(L.size());   // per layer: the slots the blocks hold (empty: none)
+        for (int b : blocks)
+            for (const core::VramPool::Span& sp : P->block_slots(b)) {
+                const int li = reg[(size_t) sp.region].first;
+                if (li < 0) continue;
+                std::vector<char>& t = took[(size_t) li];
+                if (t.empty()) t.assign((size_t) L[(size_t) li].n_slots, 0);
+                for (int s = sp.first; s < sp.first + sp.count; ++s) t[(size_t) s] = 1;
+            }
+        std::vector<std::array<int, 3>> moves;   // (layer, the spare's new slot, the expert it drops or -1)
+        for (size_t li = 0; li < L.size(); ++li) {
+            const Layer& l = L[li];
+            const std::vector<char>& t = took[li];
+            if (t.empty() || l.spare_vram < 0 || !t[(size_t) l.spare_vram]) continue;
+            std::vector<char> ok((size_t) l.n_slots, 0);   // the slots it leaves the layer: live, not recent
+            for (int s = 0; s < l.n_slots; ++s)
+                ok[(size_t) s] = !t[(size_t) s] && s != l.spare_vram &&
+                                 !(l.rc_n > 0 && s >= l.rc_base && s < l.rc_base + l.rc_n) &&
+                                 (s >= (int) l.lent_n.size() || l.lent_n[(size_t) s] == 0);
+            int e = -1;
+            const int to = lend::spare_slot(l.slot, l.heat, ok, e);
+            if (to < 0) {
+                err = "layer " + std::to_string(l.il) + ": no slot left for the swap spare";
+                return false;
+            }
+            moves.push_back({(int) li, to, e});
+        }
         std::vector<std::vector<unsigned long long>> upd(devs.size());
+        auto drop = [&](Layer& l, int e) {   // (out of `slot` already)
+            if (l.lay.fmt == gg::kFmtMXFP4) {
+                l.host[(size_t) e] = (uint8_t*) mx_mat(l, e, 0);
+            } else {
+                l.hh[(size_t) e] = {file_part(l, e), nullptr, nullptr, nullptr};
+                l.host[(size_t) e] = l.hh[(size_t) e][0];
+            }
+            --l.n_vram;
+            for (int m = 0; m < l.nm; ++m) {
+                const Layer& x = member(l, m);
+                upd[(size_t) x.dev].push_back((unsigned long long) (x.vram_tab + e));
+                upd[(size_t) x.dev].push_back(0ull);
+            }
+        };
+        for (const std::array<int, 3>& mv : moves) {
+            Layer& l = L[(size_t) mv[0]];
+            if (mv[2] >= 0) {
+                l.slot[(size_t) mv[2]] = -1;
+                drop(l, mv[2]);
+            }
+            l.lent_free.erase(std::remove(l.lent_free.begin(), l.lent_free.end(), mv[1]), l.lent_free.end());
+            l.spare_vram = mv[1];
+        }
         std::vector<int> dropped;
         for (int b : blocks)
             for (const core::VramPool::Span& sp : P->block_slots(b)) {
@@ -11594,20 +11647,7 @@ struct Model::Impl {
                 if (l.lent_n.empty()) l.lent_n.assign((size_t) l.n_main, 0);
                 dropped.clear();
                 lend::slots_out(l.slot, l.lent_n, l.lent_free, sp.first, sp.count, dropped);
-                for (int e : dropped) {
-                    if (l.lay.fmt == gg::kFmtMXFP4) {
-                        l.host[(size_t) e] = (uint8_t*) mx_mat(l, e, 0);
-                    } else {
-                        l.hh[(size_t) e] = {file_part(l, e), nullptr, nullptr, nullptr};
-                        l.host[(size_t) e] = l.hh[(size_t) e][0];
-                    }
-                    --l.n_vram;
-                    for (int m = 0; m < l.nm; ++m) {
-                        const Layer& x = member(l, m);
-                        upd[(size_t) x.dev].push_back((unsigned long long) (x.vram_tab + e));
-                        upd[(size_t) x.dev].push_back(0ull);
-                    }
-                }
+                for (int e : dropped) drop(l, e);
             }
         lend_tables(upd);
         cudaSetDevice(devs[(size_t) di].id);
