@@ -969,16 +969,25 @@ struct LendView {
 };
 LendView lend_view(Glm5Model::FastState& F, int l0, int lt, int n_expert, int keep);
 // The main slots of `blocks` (mapped blocks of F.vpool) leave the tables: a resident there moves into an empty slot
-// of its layer outside the set, or over a colder resident (which goes to the RAM tier, or to disk), or itself goes
-// to the RAM tier or to disk; a spare there leaves the spare table; the slots are kLent.  The device tables are
-// updated on F.cs (synchronized).  The caller has quiesced the part (no token in flight, no background move, no
-// demotion draining).  Takes F.mu.
+// of its layer outside the set, or over a colder resident (which leaves VRAM), or itself leaves VRAM; a spare there
+// leaves the spare table; the slots are kLent.  The experts that leave VRAM go to the RAM tier hottest first, a D2H
+// copy each, while their bytes fit in `park_max` (and the tier has a free slot or a colder expert to give up); the
+// rest go to disk, as an expert the boundary drops - the routes that want one read it there and the background
+// moves bring it back up.  The copies are what a lend costs on a slow link (8 MiB an expert at ~3 GB/s, with the
+// decode stopped), so the caller bounds them (lend_park_budget).  The device tables are updated on F.cs
+// (synchronized).  The caller has quiesced the part (no token in flight, no background move, no demotion draining).
+// Takes F.mu.
 struct LendCounts {
     uint64_t moved = 0, parked = 0, dropped = 0;   // experts moved to colder slots, to the RAM tier, to disk
     int slots = 0;                                  // main slots lent
+    size_t park_bytes = 0;                          // copied to the RAM tier
 };
 bool lend_take(Glm5Model::FastState& F, int l0, int lt, int n_expert, const std::vector<int>& blocks, LendCounts& c,
-               std::string& err);
+               std::string& err, size_t park_max = SIZE_MAX);
+// What a lend copies to the RAM tier at most, in bytes, over the parts of its card: STRATA_GLM_LEND_PARK_MB (a whole
+// number of MiB, 0: every leaving expert to disk), else 512 MiB - ~0.2 s of D2H on a PCIe 4.0 x4 card; the rest of
+// an 8 GiB lend's leaving experts go to disk.
+size_t lend_park_budget();
 // ... then the card is synchronized (cudaDeviceSynchronize on `dev`, the current device) and the blocks unmapped.  On
 // failure the blocks are mapped back where they can be and their slots are free again.
 bool lend_unmap(Glm5Model::FastState& F, int dev, const std::vector<int>& blocks, std::string& err);
