@@ -2,6 +2,7 @@
 #include "strata/core/vram_lend.hpp"
 
 #include <atomic>
+#include <cctype>
 #include <charconv>
 #include <climits>
 #include <sstream>
@@ -34,6 +35,46 @@ std::size_t lendable_bytes(std::size_t pool_bytes, std::size_t prompt_borrow_byt
     if (left <= min_slots_bytes) return 0;
     left -= min_slots_bytes;
     return left / block_bytes * block_bytes;
+}
+
+LendLineKind lend_line_kind(const std::string& line) {
+    // the first word, as handle() splits the line (blanks, a trailing CR among them)
+    std::size_t a = 0;
+    while (a < line.size() && std::isspace((unsigned char) line[a])) ++a;
+    std::size_t b = a;
+    while (b < line.size() && !std::isspace((unsigned char) line[b])) ++b;
+    const std::string w = line.substr(a, b - a);
+    if (w == "LENDABLE") return LendLineKind::lendable;
+    if (w == "LEND" || w == "RETURN") return LendLineKind::change;
+    return LendLineKind::none;
+}
+
+bool LendQueue::route(const std::string& line) {
+    if (lend_line_kind(line) == LendLineKind::none) return false;
+    std::lock_guard<std::mutex> lk(mu_);
+    q_.push_back(line);
+    n_.store(q_.size(), std::memory_order_release);
+    return true;
+}
+
+bool LendQueue::take(std::string& line) {
+    if (!waiting()) return false;
+    std::lock_guard<std::mutex> lk(mu_);
+    if (q_.empty()) return false;
+    line = std::move(q_.front());
+    q_.pop_front();
+    n_.store(q_.size(), std::memory_order_release);
+    return true;
+}
+
+bool LendQueue::take_lendable(std::string& line) {
+    if (!waiting()) return false;
+    std::lock_guard<std::mutex> lk(mu_);
+    if (q_.empty() || lend_line_kind(q_.front()) != LendLineKind::lendable) return false;
+    line = std::move(q_.front());
+    q_.pop_front();
+    n_.store(q_.size(), std::memory_order_release);
+    return true;
 }
 
 std::size_t LendCommands::lent_mib(int dev) const {

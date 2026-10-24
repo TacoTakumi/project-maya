@@ -7,13 +7,17 @@
 #include <map>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 using strata::core::GiveBack;
 using strata::core::LendCard;
 using strata::core::LendCommands;
+using strata::core::LendLineKind;
+using strata::core::LendQueue;
 using strata::core::LendResult;
 using strata::core::VramLender;
+using strata::core::lend_line_kind;
 using strata::core::lendable_bytes;
 #define CHECK(expr) do { if (!(expr)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #expr); return 1; } } while (0)
 #define CHECK_REPLY(desk, line, want) do { std::string r_; \
@@ -216,6 +220,58 @@ int main() {
     // status(): the same figures the LENDABLE lines show, with the block size
     const auto st = desk.status();
     CHECK(st.size() == 3 && st[1].dev == 2 && st[1].lendable_mib == 0 && st[1].lent_mib == 400 && st[1].block_mib == 100);
+
+    // ---- the control-line routing: which lines are lend commands, and which of them only read
+    for (const char* l : {"LENDABLE", "  LENDABLE \r", "LENDABLE 0", "LENDABLE\t"})
+        CHECK(lend_line_kind(l) == LendLineKind::lendable);
+    for (const char* l : {"LEND 0 64", "LEND", "LEND x 10", " RETURN 7", "RETURN", "RETURN 1 2", "LEND 0 64\r"})
+        CHECK(lend_line_kind(l) == LendLineKind::change);
+    for (const char* l : {"", "   ", "GEN 1 2 3", "QUIT", "STOP", "STOP 3", "PAUSE keep", "VLEND", "VRECLAIM",
+                          "LENDX 0 10", "lend 0 10", "RETURNED 1", "LENDABLES", "LENT 1 0 64", "END", "X LEND 0 64"})
+        CHECK(lend_line_kind(l) == LendLineKind::none);
+
+    // ---- the queue between a reader thread and the command loop: lend lines only, in order; a LENDABLE is taken
+    // ahead of the loop's quiet point only while no LEND or RETURN is in front of it
+    LendQueue q;
+    std::string l;
+    CHECK(!q.waiting() && !q.take(l) && !q.take_lendable(l));
+    CHECK(!q.route("GEN 4 rid=1 1,2,3") && !q.route("STOP") && !q.route("") && !q.waiting());
+    CHECK(q.route("LENDABLE"));
+    CHECK(q.waiting());
+    CHECK(q.route("LEND 0 64") && q.route("LENDABLE") && q.route("RETURN 3"));
+    CHECK(q.take_lendable(l) && l == "LENDABLE");
+    CHECK(!q.take_lendable(l) && q.waiting());   // a LEND in front: the LENDABLE behind it waits too
+    CHECK(q.take(l) && l == "LEND 0 64");
+    CHECK(q.take_lendable(l) && l == "LENDABLE");
+    CHECK(!q.take_lendable(l) && q.waiting());
+    CHECK(q.take(l) && l == "RETURN 3");
+    CHECK(!q.waiting() && !q.take(l) && !q.take_lendable(l));
+    // a reader thread and the loop at once: every lend line arrives once and in order, the others are left out
+    {
+        LendQueue tq;
+        constexpr int kN = 2000;
+        std::thread reader([&tq] {
+            for (int i = 0; i < kN; ++i) {
+                tq.route("GEN 1 rid=" + std::to_string(i) + " 1");
+                tq.route(i % 3 == 0 ? "LENDABLE" : "RETURN " + std::to_string(i));
+            }
+        });
+        int next = 0, polls = 0;
+        while (next < kN && polls < 100000000) {
+            ++polls;
+            std::string got;
+            if (!tq.take(got)) continue;
+            const std::string want = next % 3 == 0 ? "LENDABLE" : "RETURN " + std::to_string(next);
+            if (got != want) {
+                std::fprintf(stderr, "queue order: got '%s', want '%s'\n", got.c_str(), want.c_str());
+                reader.join();
+                return 1;
+            }
+            ++next;
+        }
+        reader.join();
+        CHECK(next == kN && !tq.waiting());
+    }
 
     std::printf("vram_lend_test: all checks passed\n");
     return 0;

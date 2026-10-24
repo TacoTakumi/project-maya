@@ -324,13 +324,13 @@ target_include_directories(strata_lend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/includ
 target_link_libraries(strata_lend PRIVATE strata_warnings)
 if(STRATA_BUILD_TESTS)
   enable_testing()
+  find_package(Threads REQUIRED)
   add_executable(vram_lend_test tests/vram_lend_test.cpp)
-  target_link_libraries(vram_lend_test PRIVATE strata_lend strata_warnings)
+  target_link_libraries(vram_lend_test PRIVATE strata_lend strata_warnings Threads::Threads)
   add_test(NAME vram_lend_test COMMAND vram_lend_test)
   set_tests_properties(vram_lend_test PROPERTIES TIMEOUT 60)
   # maya-ds4's control-line routing (src/ds4/ds4_lines.hpp): lend lines queued for the main thread, STOP and the
   # requests as before - header-only and plain C++, no model, no GPU
-  find_package(Threads REQUIRED)
   add_executable(ds4_lines_test tests/ds4_lines_test.cpp)
   target_include_directories(ds4_lines_test PRIVATE src/ds4)
   target_link_libraries(ds4_lines_test PRIVATE strata_lend strata_warnings Threads::Threads)

@@ -50,6 +50,7 @@
 #include "strata/prefill/failure.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/glm_model.hpp"
+#include "strata/core/vram_lend.hpp"
 #include "strata/core/mtp_rows.hpp"
 #include "strata/core/split_groups.hpp"
 #include "strata/core/prefix_cut.hpp"
@@ -1211,6 +1212,10 @@ static int glm_pack_generate(const Options& o) {
     std::condition_variable in_cv;
     std::deque<std::string> in_lines;
     bool in_eof = false;
+    // the lend commands (LEND, RETURN, LENDABLE: strata/core/vram_lend.hpp) wait in a queue of their own, so a request
+    // that decodes or reads its prompt sees them as it sees a STOP; the main thread answers them (they touch the expert
+    // slots), never the reader
+    strata::core::LendQueue lend_q;
     if (o.serve) {
         std::thread([&] {
             std::string l, buf;
@@ -1241,6 +1246,11 @@ static int glm_pack_generate(const Options& o) {
             while (getline_fd(l)) {
                 strata::platform::idle_poke();   // (the service threads asleep after a long quiet wake for this line)
                 if (!l.empty() && l.back() == '\r') l.pop_back();
+                if (lend_q.route(l)) {   // (the wake-up under in_mu: next_line's wait cannot miss it)
+                    std::lock_guard<std::mutex> lk(in_mu);
+                    in_cv.notify_one();
+                    continue;
+                }
                 if (l == "STOP") { stop_req.store(true); continue; }
                 if (l.rfind("STOP ", 0) == 0 || (l.rfind("PAUSE ", 0) == 0 && l != "PAUSE keep")) {
                     std::istringstream ls(l);
@@ -1281,15 +1291,33 @@ static int glm_pack_generate(const Options& o) {
             in_cv.notify_one();
         }).detach();
     }
+    // the next line, waiting for one: a lend command first (idle: answered at once), else the next request
     const auto next_line = [&](std::string& out) -> bool {
         model.lane_drift_check();
         model.lane_retime();
         std::unique_lock<std::mutex> lk(in_mu);
-        in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof || quit_req.load(); });
+        in_cv.wait(lk, [&] { return lend_q.waiting() || !in_lines.empty() || in_eof || quit_req.load(); });
+        if (lend_q.take(out)) return true;
         if (in_lines.empty()) return false;   // EOF or QUIT with nothing queued behind it
         out = std::move(in_lines.front());
         in_lines.pop_front();
         return true;
+    };
+    // LEND / RETURN / LENDABLE (strata/core/vram_lend.hpp): one handler and its leases for the engine's life, over
+    // every card of the split (make_glm_lender's calling rules).  The answers are whole lines written by this thread
+    // outside a prompt-path call, so they never land inside a T or PP line
+    const std::unique_ptr<strata::core::VramLender> lender = strata::core::make_glm_lender(model);
+    strata::core::LendCommands lends(*lender);
+    const auto lend_reply = [&](const std::string& l) {
+        std::string reply;
+        lends.handle(l, reply);
+        std::fputs(reply.c_str(), stdout);
+        std::fflush(stdout);
+    };
+    // every waiting lend command - only where nothing is in flight on any part: idle, between two prompt-path calls,
+    // after a decode stopped for them (run_request), after the scheduler's drain (several conversations)
+    const auto serve_lends = [&] {
+        for (std::string l; lend_q.take(l);) lend_reply(l);
     };
 
     std::vector<int32_t> snap_tokens;   // the prompt prefix the model's saved state belongs to (conversation reuse)
@@ -1930,6 +1958,11 @@ static int glm_pack_generate(const Options& o) {
             }
             int seg_chunk = 0;   // (exact pieces: the chunk the segment's uncut read takes, from its first piece on)
             while (pok && at < snap_at) {
+                // the lend commands that came during the last call, before the next: between two calls the pool's
+                // tail is back and nothing is in flight (a gap or an interleave round drained what it issued), so a
+                // lend waits one call at most - a piece, a segment between checkpoints (STRATA_GLM_CKPT_EVERY), or the
+                // whole prompt where nothing cuts it
+                serve_lends();
                 const size_t seg_end = mi < marks.size() ? marks[mi] : snap_at;
                 size_t piece = prompt_piece ? prompt_piece() : 0;
                 if (piece > 0 && interleave.exact) {
@@ -2194,6 +2227,18 @@ static int glm_pack_generate(const Options& o) {
         std::vector<int32_t> emitted;   // every token this request wrote (a PAUSE keeps the state they lead to)
         bool in_arg = false;     // inside a tool call's <arg_value> (the answer's position, for the loop guard)
         int guard_fired = 0;     // soft landings in this answer: a second loop ends it
+        // LEND / RETURN while the request decodes: the decode stops at a token as for a STOP (lend_stop), the lend runs
+        // with nothing in flight, and the decode goes on (lend_resume).  A LENDABLE is answered at the token.  Not with
+        // --spec-follow (its continuation moves with every pick the decode makes, kept or not): the lend waits for
+        // the request's end there
+        const bool lend_stops = o.serve && model.fast() && follow_ids.empty();
+        bool lend_stop = false;
+        int tok_force = -1;      // the token this token forced: forced again after a lend stop (the decode may have
+                                 // taken it without writing it)
+        const auto force_next = [&](int t) {
+            model.force_next(t);
+            tok_force = t;
+        };
         const auto looping = [&](int w) -> int {   // the pattern's period, 0 when the tail is not one
             const int n = (int) gen_hist.size();
             if (w <= 0 || n < w) return 0;
@@ -2206,6 +2251,7 @@ static int glm_pack_generate(const Options& o) {
         };
         const auto on_token = [&](int tok) -> bool {
             std::printf("T %d\n", tok);
+            tok_force = -1;
             ++produced;
             emitted.push_back((int32_t) tok);
             if (sp.host_history != nullptr) pen_hist.push_back((int32_t) tok);   // (fed next: the picks after count it)
@@ -2214,7 +2260,7 @@ static int glm_pack_generate(const Options& o) {
             gen_hist.push_back(tok);
             if (in_think && tok != req_think_end) {
                 if (const int per = looping(loop_w_think)) {
-                    model.force_next(req_think_end);   // as the budget does: the next token closes the reasoning
+                    force_next(req_think_end);   // as the budget does: the next token closes the reasoning
                     in_think = false;
                     char m[200];
                     std::snprintf(m, sizeof m, "thinking was repeating a %d-token pattern (%d tokens in): closed, "
@@ -2235,7 +2281,7 @@ static int glm_pack_generate(const Options& o) {
                         // a soft landing: close what the model is in the middle of instead of cutting the response -
                         // a tool call's argument ends (the call completes with what was written, the agent runs it
                         // and sees the result), plain text ends the turn (finish "stop")
-                        model.force_next(in_arg ? kArgValueEnd : kUser);
+                        force_next(in_arg ? kArgValueEnd : kUser);
                         std::snprintf(m, sizeof m, "the answer was repeating a %d-token pattern (%d tokens in): %s",
                                       per, (int) produced, in_arg ? "the tool call's argument was closed there"
                                                                   : "the turn was ended there");
@@ -2253,7 +2299,7 @@ static int glm_pack_generate(const Options& o) {
                 }
             }
             if (in_think && (tok == req_think_end || produced >= req_think_budget || wrap_req.load())) {
-                if (tok != req_think_end) model.force_next(req_think_end);   // the budget: the next token closes it
+                if (tok != req_think_end) force_next(req_think_end);   // the budget: the next token closes it
                 in_think = false;
                 gen_hist.clear();
             }
@@ -2285,76 +2331,133 @@ static int glm_pack_generate(const Options& o) {
                 finish = "cancel";
                 return false;
             }
-            return produced < max_new;
+            if (produced >= max_new) return false;
+            if (lend_stops && lend_q.waiting()) {
+                for (std::string l; lend_q.take_lendable(l);) lend_reply(l);   // (only reads: no stop for it)
+                if (lend_q.waiting()) {
+                    lend_stop = true;
+                    return false;
+                }
+            }
+            return true;
         };
-        if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.dflash_ready() && req_spec != 1) {
-            // the DFlash decode: a block of drafts a round, one verify window checks them (same tokens as the loop
-            // below for the same samples); --spec T caps a round's window at T tokens
-            int64_t n_spec = 0;
-            const int spec = req_spec >= 2 ? req_spec : o.spec;   // this request's window, else --spec
-            const int n_max = spec >= 2 ? spec - 1 : -1;            // -1: the engine's (decode_dflash)
-            // the drafts stop at a selector confidence below the cut: the request's, else --spec-min-p, else the
-            // engine's (-1: decode_dflash picks it for the window it verifies with)
-            const float p_min = req_spec_min_p >= 0.0 && req_spec_min_p <= 1.0 ? (float) req_spec_min_p
-                                : o.spec_min_p_set                         ? (float) o.spec_min_p
-                                                                           : -1.0f;
-            if (!model.decode_dflash(sp, max_new, n_max, p_min, on_token, n_spec, err, req_spec_n_min,
-                                     req_spec_cum >= 0.0 && req_spec_cum <= 1.0 ? (float) req_spec_cum : -1.0f)) {
-                drop_if_poisoned(prompt, err);
-                std::printf("ERR %s\n", err.c_str());
-                return 1;
-            }
-        } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.mtp_ready() && req_spec != 1) {
-            // the one-GPU MTP decode (glm_mtp.cu; by default on the Strix / Gorgon Halo APUs): the NextN block drafts,
-            // one verify window checks the drafts (same tokens as the loop below for the same samples)
-            int64_t n_spec = 0;
-            const uint64_t rounds0 = model.mtp_rounds_;
-            uint64_t len0[9];
-            std::copy(model.mtp_round_n_, model.mtp_round_n_ + 9, len0);
-            if (!model.decode_mtp(sp, max_new, on_token, n_spec, err)) {
-                drop_if_poisoned(prompt, err);
-                std::printf("ERR %s\n", err.c_str());
-                return 1;
-            }
-            if (model.mtp_rounds_ > rounds0) {
-                std::string lens;
-                for (int i = 0; i < 9; ++i)
-                    if (model.mtp_round_n_[i] > len0[i])
-                        lens += " " + std::to_string(i) + ":" + std::to_string(model.mtp_round_n_[i] - len0[i]);
-                std::fprintf(stderr, "glm mtp: %llu rounds, %.2f tokens a round | rounds by draft length%s\n",
-                             (unsigned long long) (model.mtp_rounds_ - rounds0),
-                             (double) n_spec / (double) (model.mtp_rounds_ - rounds0), lens.c_str());
-            }
-        } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.spec_ready()) {
-            // the pipelined speculative decode: the two halves of the split work on consecutive tokens, the head
-            // running the NextN block's draft (same tokens as the loop below)
-            int64_t n_spec = 0;
-            if (!model.decode_spec(sp, max_new, on_token, n_spec, err)) {
-                drop_if_poisoned(prompt, err);
-                std::printf("ERR %s\n", err.c_str());
-                return 1;
-            }
-        } else {
-            for (;;) {
-                if (stop_req.load()) {
-                    finish = "cancel";
-                    break;
+        // after a lend stop: the state read on to the last token written, its logits on the tail as after a prompt's
+        // last token.  The decode stopped with the state at the tokens it had read - every written token but the last
+        // one or few, as for a PAUSE - and those are read now; where it had read them all (a DFlash window that kept
+        // the token it stopped at) the logits after the last are gone, and the state is read again from the prompt's
+        // snapshot (from the start without one)
+        const auto lend_resume = [&](std::string& e) -> bool {
+            std::vector<int32_t> seq(prompt);
+            seq.insert(seq.end(), emitted.begin(), emitted.end());
+            int64_t p = model.position();
+            if (p < (int64_t) prompt.size() || p >= (int64_t) seq.size()) {
+                if (!snap_tokens.empty() && snap_tokens.size() < seq.size() &&
+                    std::equal(snap_tokens.begin(), snap_tokens.end(), seq.begin()) &&
+                    img_hash(snap_tokens.size()) == snap_img_hash && model.snapshot_restore()) {
+                    p = (int64_t) snap_tokens.size();
+                } else {
+                    model.reset();
+                    p = 0;
                 }
-                int tok = model.sample_token(sp, err);
-                if (tok < 0) {
+                std::fprintf(stderr, "glm lend: the decode stopped with every written token read: %zu tokens read "
+                                     "again\n", seq.size() - (size_t) p);
+            }
+            size_t at = (size_t) p;
+            const size_t last = seq.size() - 1;
+            if (model.prefill_chunk() > 0 && last > at + 1) {   // all but the last: the prompt path, if it takes them
+                const std::vector<int32_t> part(seq.begin() + (long) at, seq.begin() + (long) last);
+                if (model.prefill(part, e, seq[last])) at = last;
+                else if (!e.empty()) return false;
+            }
+            std::vector<float> lg;
+            while (at < seq.size()) {
+                const size_t n = std::min<size_t>(8, seq.size() - at);
+                const std::vector<int32_t> part(seq.begin() + (long) at, seq.begin() + (long) (at + n));
+                if (!model.forward(part, lg, e)) return false;
+                at += n;
+            }
+            return true;
+        };
+        for (;;) {   // (once, and again after each lend stop for the tokens still to write)
+            lend_stop = false;
+            const int64_t left = max_new - produced;
+            if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.dflash_ready() && req_spec != 1) {
+                // the DFlash decode: a block of drafts a round, one verify window checks them (same tokens as the loop
+                // below for the same samples); --spec T caps a round's window at T tokens
+                int64_t n_spec = 0;
+                const int spec = req_spec >= 2 ? req_spec : o.spec;   // this request's window, else --spec
+                const int n_max = spec >= 2 ? spec - 1 : -1;            // -1: the engine's (decode_dflash)
+                // the drafts stop at a selector confidence below the cut: the request's, else --spec-min-p, else the
+                // engine's (-1: decode_dflash picks it for the window it verifies with)
+                const float p_min = req_spec_min_p >= 0.0 && req_spec_min_p <= 1.0 ? (float) req_spec_min_p
+                                    : o.spec_min_p_set                         ? (float) o.spec_min_p
+                                                                               : -1.0f;
+                if (!model.decode_dflash(sp, left, n_max, p_min, on_token, n_spec, err, req_spec_n_min,
+                                         req_spec_cum >= 0.0 && req_spec_cum <= 1.0 ? (float) req_spec_cum : -1.0f)) {
                     drop_if_poisoned(prompt, err);
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
-                tok = model.forced(tok);
-                sp.counter += 1;
-                if (!on_token(tok)) break;
-                if (!model.forward({(int32_t) tok}, lg, err)) {
+            } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.mtp_ready() && req_spec != 1) {
+                // the one-GPU MTP decode (glm_mtp.cu; by default on the Strix / Gorgon Halo APUs): the NextN block
+                // drafts, one verify window checks the drafts (same tokens as the loop below for the same samples)
+                int64_t n_spec = 0;
+                const uint64_t rounds0 = model.mtp_rounds_;
+                uint64_t len0[9];
+                std::copy(model.mtp_round_n_, model.mtp_round_n_ + 9, len0);
+                if (!model.decode_mtp(sp, left, on_token, n_spec, err)) {
                     drop_if_poisoned(prompt, err);
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+                if (model.mtp_rounds_ > rounds0) {
+                    std::string lens;
+                    for (int i = 0; i < 9; ++i)
+                        if (model.mtp_round_n_[i] > len0[i])
+                            lens += " " + std::to_string(i) + ":" + std::to_string(model.mtp_round_n_[i] - len0[i]);
+                    std::fprintf(stderr, "glm mtp: %llu rounds, %.2f tokens a round | rounds by draft length%s\n",
+                                 (unsigned long long) (model.mtp_rounds_ - rounds0),
+                                 (double) n_spec / (double) (model.mtp_rounds_ - rounds0), lens.c_str());
+                }
+            } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.spec_ready()) {
+                // the pipelined speculative decode: the two halves of the split work on consecutive tokens, the head
+                // running the NextN block's draft (same tokens as the loop below)
+                int64_t n_spec = 0;
+                if (!model.decode_spec(sp, left, on_token, n_spec, err)) {
+                    drop_if_poisoned(prompt, err);
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
+            } else {
+                for (;;) {
+                    if (stop_req.load()) {
+                        finish = "cancel";
+                        break;
+                    }
+                    int tok = model.sample_token(sp, err);
+                    if (tok < 0) {
+                        drop_if_poisoned(prompt, err);
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                    tok = model.forced(tok);
+                    sp.counter += 1;
+                    if (!on_token(tok)) break;
+                    if (!model.forward({(int32_t) tok}, lg, err)) {
+                        drop_if_poisoned(prompt, err);
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                }
             }
+            if (!lend_stop) break;
+            serve_lends();   // (the decode returned: its streams drained, nothing in flight)
+            if (!lend_resume(err)) {
+                drop_if_poisoned(prompt, err);
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
+            }
+            if (tok_force >= 0) model.force_next(tok_force);   // (a stop inside a window may have taken it unwritten)
         }
         const auto t2 = std::chrono::steady_clock::now();
         const double prompt_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -2550,6 +2653,7 @@ static int glm_pack_generate(const Options& o) {
     strata::core::Glm5Model::FastStats multi_st1;
     uint64_t multi_spec0 = 0, multi_hits0 = 0, multi_mtp_acc = 0, multi_mtp_off = 0;   // (the drafts since then, for the STAT lines)
     const auto input_pending = [&]() -> bool {
+        if (lend_q.waiting()) return true;   // (a lend command: the loop's top answers it, after the drain)
         std::lock_guard<std::mutex> lk(in_mu);
         return !in_lines.empty() || quit_req.load();
     };
@@ -3168,6 +3272,7 @@ static int glm_pack_generate(const Options& o) {
                     forced_unused = g.force;
                     g.force = -1;
                 }
+                for (std::string l; lend_q.take_lendable(l);) lend_reply(l);   // (only reads: no stop for it)
                 if (input_pending()) {
                     interrupted = true;
                     return false;
@@ -4044,7 +4149,9 @@ static int glm_pack_generate(const Options& o) {
     // the serve wire contract (serve/server.py): READY <max_context> [stop] once, then GEN <max_new>
     // [<key>=<value> ...] <id,id,...> lines - the sampling keys are per request and the ids are the LAST
     // token.  "stop" is NOT advertised: a request runs to its end (no mid-request cancel in M3.1).
-    // "pause": PAUSE keeps the written state; "multi=<n>": n conversations at once (GEN rid=<id>, see gen_admit)
+    // "pause": PAUSE keeps the written state; "multi=<n>": n conversations at once (GEN rid=<id>, see gen_admit).
+    // LEND <dev> <mib>, RETURN <id> and LENDABLE lend the expert slots' VRAM out and take it back, also while requests
+    // run (strata/core/vram_lend.hpp; <dev> is the VRAM lines' dev=)
     if (multi) std::printf("READY %lld stop pause multi=%d\n", (long long) o.max_context, model.seq_count());
     else std::printf("READY %lld stop pause\n", (long long) o.max_context);
     std::fprintf(stderr, "maya generate: glm5-next serve (M3.1): GEN <max_new> [keys] <ids>, GENI <max_new> [keys] "
@@ -4068,6 +4175,18 @@ static int glm_pack_generate(const Options& o) {
     };
     std::string line;
     for (;;) {
+        // the lend commands (LEND, RETURN, LENDABLE), also while requests run: between two scheduler steps, every
+        // issued token and window taken back first (multi_drain), so nothing is in flight on any part.  The decode
+        // steps of a prompt being read come back here only once its read has ended; between its calls prep_prompt
+        // answers them
+        if (lend_q.waiting()) {
+            if (multi && !gens.empty()) {
+                if (!multi_drain()) multi_fail(err);
+                if (std::any_of(gens.begin(), gens.end(), [](const std::unique_ptr<Gen>& p) { return p->done; }))
+                    gen_sweep();
+            }
+            serve_lends();
+        }
         if (multi && !pending.empty()) admit_pending();
         if (multi && !gens.empty()) {   // requests running: a line when one is there, else one scheduler step
             if (!try_line(line)) {
@@ -4080,6 +4199,10 @@ static int glm_pack_generate(const Options& o) {
             }
         } else if (!next_line(line)) {
             break;
+        }
+        if (strata::core::lend_line_kind(line) != strata::core::LendLineKind::none) {   // (idle: next_line's)
+            lend_reply(line);
+            continue;
         }
         std::istringstream ss(line);
         std::string cmd;
@@ -4357,7 +4480,8 @@ static int glm_pack_generate(const Options& o) {
             continue;
         }
         if (cmd.empty()) continue;
-        std::printf("ERR unsupported command '%s' (GEN, GENI, LOGP, VLEND, VRECLAIM, STOP and QUIT)\n", cmd.c_str());
+        std::printf("ERR unsupported command '%s' (GEN, GENI, LOGP, VLEND, VRECLAIM, STOP, QUIT, LEND, RETURN and "
+                    "LENDABLE)\n", cmd.c_str());
     }
     // the engine ends (QUIT, or the server gone): the conversation in the model is kept for the next start
     if (multi) {   // the requests still running end here (their DONE lines), then every context's conversation
