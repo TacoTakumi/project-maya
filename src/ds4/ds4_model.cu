@@ -913,6 +913,10 @@ struct Layer {
     // s * unit in general (a block holds whole slots); vram_base is slot 0's)
     const core::VramPool* vp = nullptr;
     int vr = -1;
+    // a lend of the pool (ds4_lend.cu; on member 0, for the layer's main slots): per slot, how many cards have its
+    // block lent now (> 0: out of use, never in `slot`), and the slots back from a lend, empty, that the cache fills
+    // (cache_queue) - both empty until a lend
+    std::vector<int> lent_n, lent_free;
     uint8_t* xbase = nullptr;
     size_t xstep = 0;
     // a prompt read in parts that keeps its lend between them (lend_hold): expert -> 1 while its slot lies under the
@@ -1682,6 +1686,7 @@ struct Model::Impl {
         int layer = 0, in = -1, out = -1;
         int ram = -1;   // (copy_mode, `in` held in RAM) the spare slot `out` is copied into from VRAM
         unsigned win = 0;   // (win_now at the tick that queued it)
+        int to = -1;    // a fill: `in` into this slot back from a lend (lent_free) instead of the spare; out -1
     };
     static constexpr int kMaxSwaps = 8;
     // the swap rule: a CPU-lane expert in when its heat passes the coldest VRAM one's x margin + bonus; heat x decay
@@ -10584,6 +10589,8 @@ struct Model::Impl {
                 sw_ready.push_back(sw);
                 continue;
             }
+            const int dst = sw.to >= 0 ? sw.to : l.spare_vram;   // (a fill: nothing goes out)
+            const bool keep_out = !file_experts && sw.out >= 0;
             auto off_turn = [&](int di, cudaStream_t cs) {   // (false: quitting)
                 while (!copy_open(di, sw.win)) {
                     if (quit.load()) return false;
@@ -10592,7 +10599,8 @@ struct Model::Impl {
                 copy_after_idle(di, cs);
                 return true;
             };
-            if (direct_packed && l.packed_host && NH == 1 && !file_experts && l.nm == 2 &&
+            // (a fill - a slot back from a lend, nothing out - takes the plain path below)
+            if (direct_packed && sw.to < 0 && sw.out >= 0 && l.packed_host && NH == 1 && !file_experts && l.nm == 2 &&
                 member(l, 0).hblob == member(l, 1).hblob) {
                 // Packed host slots already contain the members' GPU-ready blobs.
                 // The incoming host and outgoing VRAM slots stay owned until
@@ -10644,8 +10652,8 @@ struct Model::Impl {
                     cudaSetDevice(d.id);
                     cudaStream_t cs = B.st[(size_t) l.dev];
                     if (!off_turn(l.dev, cs)) return;
-                    cudaMemcpyAsync(sat(l, l, l.spare_vram, l.blob), B.a, l.blob, cudaMemcpyHostToDevice, cs);
-                    if (!file_experts)
+                    cudaMemcpyAsync(sat(l, l, dst, l.blob), B.a, l.blob, cudaMemcpyHostToDevice, cs);
+                    if (keep_out)
                         cudaMemcpyAsync(B.b, sat(l, l, l.slot[(size_t) sw.out], l.blob), l.blob,
                                         cudaMemcpyDeviceToHost, cs);
                     cudaStreamSynchronize(cs);
@@ -10656,9 +10664,9 @@ struct Model::Impl {
                         cudaStream_t cs = B.st[(size_t) x.dev];
                         blob_to_half(l, B.a, m, B.h);
                         if (!off_turn(x.dev, cs)) return;
-                        cudaMemcpyAsync(sat(l, x, l.spare_vram, x.hblob), B.h, x.hblob, cudaMemcpyHostToDevice, cs);
+                        cudaMemcpyAsync(sat(l, x, dst, x.hblob), B.h, x.hblob, cudaMemcpyHostToDevice, cs);
                         cudaStreamSynchronize(cs);
-                        if (file_experts) continue;
+                        if (!keep_out) continue;
                         if (!off_turn(x.dev, cs)) return;
                         cudaMemcpyAsync(B.h, sat(l, x, l.slot[(size_t) sw.out], x.hblob), x.hblob,
                                         cudaMemcpyDeviceToHost, cs);
@@ -10666,13 +10674,13 @@ struct Model::Impl {
                         half_to_blob(l, B.h, m, B.b);
                     }
                 }
-                if (!file_experts)
+                if (keep_out)
                     for (int X = 0; X < NH; ++X) blob_to_part(l, B.b, X, l.spare_host[(size_t) X]);
             }
             if (check_swaps) {   // DS4_CHECK_SWAPS: both moves against the model file, byte for byte
                 std::vector<uint8_t> reg, blob(l.blob), part(l.hl.bytes);
                 bool ok = true;
-                for (int pass = 0; pass < (file_experts ? 1 : 2); ++pass) {   // (in place: no host copy of `out`)
+                for (int pass = 0; pass < (keep_out ? 2 : 1); ++pass) {   // (in place, a fill: no host copy of `out`)
                     const int e = pass == 0 ? sw.in : sw.out;
                     reg.resize(l.region_bytes[(size_t) e]);
                     pk.read_at(l.region_file[(size_t) e], l.region_off[(size_t) e], reg.size(), reg.data());
@@ -10680,12 +10688,12 @@ struct Model::Impl {
                         repack(l, e, reg.data(), blob.data());
                         std::vector<uint8_t> dev(l.blob);
                         if (l.nm == 1)
-                            cudaMemcpy(dev.data(), sat(l, l, l.spare_vram, l.blob), l.blob, cudaMemcpyDeviceToHost);
+                            cudaMemcpy(dev.data(), sat(l, l, dst, l.blob), l.blob, cudaMemcpyDeviceToHost);
                         else
                             for (int m = 0; m < l.nm; ++m) {   // (the members' parts, put together again)
                                 std::vector<uint8_t> h(member(l, m).hblob);
                                 cudaSetDevice(devs[(size_t) member(l, m).dev].id);
-                                cudaMemcpy(h.data(), sat(l, member(l, m), l.spare_vram, member(l, m).hblob), member(l, m).hblob,
+                                cudaMemcpy(h.data(), sat(l, member(l, m), dst, member(l, m).hblob), member(l, m).hblob,
                                            cudaMemcpyDeviceToHost);
                                 half_to_blob(l, h.data(), m, dev.data());
                             }
@@ -11083,12 +11091,13 @@ struct Model::Impl {
         bool ok = copy_mode && !l.ram.empty() && l.ram[(size_t) sw.in] >= 0
                       ? read_mx(l, sw.in, sw_a)
                       : store_blob(l, sw.in, sw_a) || read_mx_file(l, sw.in, sw_a);
+        const int dst = sw.to >= 0 ? sw.to : l.spare_vram;   // (a fill: a slot back from a lend, nothing out)
         for (int m = 0; m < l.nm && ok; ++m) {
             const Layer& x = member(l, m);
             cudaSetDevice(devs[(size_t) x.dev].id);
             cudaStream_t cs = copy_st[(size_t) x.dev];
             if (l.nm > 1) blob_to_half(l, sw_a, m, sw_h);
-            ok = cudaMemcpyAsync(sat(l, x, l.spare_vram, unit(x)), l.nm > 1 ? sw_h : sw_a, unit(x),
+            ok = cudaMemcpyAsync(sat(l, x, dst, unit(x)), l.nm > 1 ? sw_h : sw_a, unit(x),
                                  cudaMemcpyHostToDevice, cs) == cudaSuccess &&
                  cudaStreamSynchronize(cs) == cudaSuccess;
         }
@@ -11128,7 +11137,7 @@ struct Model::Impl {
             for (int m = 0; m < l.nm && ok; ++m) {
                 const Layer& x = member(l, m);
                 cudaSetDevice(devs[(size_t) x.dev].id);
-                cudaMemcpy(l.nm > 1 ? h.data() : dev.data(), sat(l, x, l.spare_vram, unit(x)), unit(x),
+                cudaMemcpy(l.nm > 1 ? h.data() : dev.data(), sat(l, x, dst, unit(x)), unit(x),
                            cudaMemcpyDeviceToHost);
                 if (l.nm > 1) half_to_blob(l, h.data(), m, dev.data());
             }
@@ -11272,7 +11281,8 @@ struct Model::Impl {
         }
         for (const Swap& sw : ready) {
             Layer& l = L[(size_t) sw.layer];
-            const int old_slot = l.slot[(size_t) sw.out];
+            const bool fill = sw.to >= 0;   // (a slot back from a lend filled: nothing goes out, the spare stays)
+            const int old_slot = fill ? -1 : l.slot[(size_t) sw.out];
             const std::array<uint8_t*, 4> old_parts = l.hh[(size_t) sw.in];
             if (copy_mode) {   // (`out` takes the RAM place `in` leaves: through the spare, which `in`'s slot becomes)
                 const int s_in = l.ram[(size_t) sw.in];
@@ -11280,7 +11290,7 @@ struct Model::Impl {
                 if (sw.ram >= 0) {
                     l.ram[(size_t) sw.out] = sw.ram;
                     copy_spare[(size_t) l.il] = s_in;
-                } else if (s_in >= 0) {   // (the move into RAM failed: `out` back to the file, one copy fewer)
+                } else if (s_in >= 0) {   // (the move into RAM failed - `out` back to the file - or a fill: one copy fewer)
                     --ram_held;
                     if (copy_spare[(size_t) l.il] < 0) copy_spare[(size_t) l.il] = s_in;
                 }
@@ -11288,27 +11298,32 @@ struct Model::Impl {
                 ram_free.push_back(l.ram[(size_t) sw.in]);
                 l.ram[(size_t) sw.in] = -1;
             }
-            l.slot[(size_t) sw.in] = l.spare_vram;
-            if (l.nm == 1) set_vm(l, sw.in, l.spare_vram);
+            l.slot[(size_t) sw.in] = fill ? sw.to : l.spare_vram;
+            if (l.nm == 1) set_vm(l, sw.in, l.slot[(size_t) sw.in]);
             l.hh[(size_t) sw.in] = {nullptr, nullptr, nullptr, nullptr};
             l.host[(size_t) sw.in] = nullptr;
-            l.slot[(size_t) sw.out] = -1;
-            if (l.lay.fmt == gg::kFmtMXFP4) {   // (the file has it)
-                l.host[(size_t) sw.out] = (uint8_t*) mx_mat(l, sw.out, 0);
-            } else if (file_experts) {   // (back to its pages in the file)
-                l.hh[(size_t) sw.out] = {file_part(l, sw.out), nullptr, nullptr, nullptr};
-                l.host[(size_t) sw.out] = l.hh[(size_t) sw.out][0];
+            if (fill) {
+                ++l.n_vram;
             } else {
-                l.hh[(size_t) sw.out] = l.spare_host;
-                l.host[(size_t) sw.out] = l.spare_host[0];
-                l.spare_host = old_parts;
+                l.slot[(size_t) sw.out] = -1;
+                if (l.lay.fmt == gg::kFmtMXFP4) {   // (the file has it)
+                    l.host[(size_t) sw.out] = (uint8_t*) mx_mat(l, sw.out, 0);
+                } else if (file_experts) {   // (back to its pages in the file)
+                    l.hh[(size_t) sw.out] = {file_part(l, sw.out), nullptr, nullptr, nullptr};
+                    l.host[(size_t) sw.out] = l.hh[(size_t) sw.out][0];
+                } else {
+                    l.hh[(size_t) sw.out] = l.spare_host;
+                    l.host[(size_t) sw.out] = l.spare_host[0];
+                    l.spare_host = old_parts;
+                }
+                l.spare_vram = old_slot;
             }
-            l.spare_vram = old_slot;
             for (int m = 0; m < l.nm; ++m) {   // (tick_flush: stream order, before the next window)
                 Layer& x = member(l, m);
                 std::vector<unsigned long long>& u = tick_upd[(size_t) x.dev];
                 u.push_back((unsigned long long) (x.vram_tab + sw.in));
                 u.push_back((unsigned long long) sat(l, x, l.slot[(size_t) sw.in], unit(x)));
+                if (fill) continue;
                 u.push_back((unsigned long long) (x.vram_tab + sw.out));
                 u.push_back(0ull);
             }
@@ -11337,21 +11352,27 @@ struct Model::Impl {
                     best = e;
             }
             if (best >= 0 && l.spare_vram >= 0 && !l.swap_pending && sw_inflight < c_inflight) {   // VRAM: the hottest in
-                int cold = -1;   // (of the layer's own slots: a recent slot's expert stays)
-                for (int e = 0; e < l.n_exp; ++e) {
+                const bool fill = !l.lent_free.empty();   // (a slot back from a lend, empty: filled, nothing out)
+                int cold = -1;   // (of the layer's own slots: a recent slot's expert stays; a lent slot is in no table)
+                for (int e = 0; e < l.n_exp && !fill; ++e) {
                     const int sl = l.slot[(size_t) e];
                     if (sl >= 0 && !(l.rc_n > 0 && sl >= l.rc_base && sl < l.rc_base + l.rc_n) &&
                         (cold < 0 || l.heat[(size_t) e] < l.heat[(size_t) cold]))
                         cold = e;
                 }
-                if (cold >= 0 && l.heat[(size_t) best] > l.heat[(size_t) cold] * c_margin + c_bonus) {
+                if (fill || (cold >= 0 && l.heat[(size_t) best] > l.heat[(size_t) cold] * c_margin + c_bonus)) {
                     l.swap_pending = true;
                     l.sw_in = best;
                     ++sw_inflight;
                     vin = best;
-                    Swap sw{l.il, best, cold};
+                    Swap sw{l.il, best, fill ? -1 : cold};
                     sw.win = win_now.load(std::memory_order_relaxed);
-                    if (copy_mode && l.ram[(size_t) best] >= 0) sw.ram = copy_spare[(size_t) l.il];   // (-1: none)
+                    if (fill) {
+                        sw.to = l.lent_free.back();
+                        l.lent_free.pop_back();
+                    } else if (copy_mode && l.ram[(size_t) best] >= 0) {
+                        sw.ram = copy_spare[(size_t) l.il];   // (-1: none)
+                    }
                     std::lock_guard<std::mutex> lk(sw_mu);
                     sw_queue.push_back(sw);
                     queued = true;
@@ -11466,6 +11487,151 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4: expert cache after the prompt: %lld moves into VRAM in %.0f ms (%d rounds, "
                                  "DS4_SETTLE_MS=%.0f)\n",
                          (long long) (st.swaps - s0), now_ms() - t0, rounds, settle_ms());
+    }
+
+    // the experts' pool lent to another program (ds4_lend.cu's lend::Lender through LendSite, between windows).  A
+    // layer lends its pool slots where the cache fills them again and the CPU lane reads an expert a lend drops with no
+    // copy of its own: one class, its main slots in a pool, a swap spare (the cache runs), its experts in the files - a
+    // GGUF's (the file's pages) or EXL3 read in place (file_experts).  Not an EXL3 layer copied into RAM (host parts
+    // only for its CPU-lane experts and the spare), nor one with every expert in VRAM (no spare, no CPU-lane copy).
+    bool lend_layer(const Layer& l) const {
+        return l.n_cls == 1 && l.vp != nullptr && l.spare_vram >= 0 && !cache_ths.empty() &&
+               (l.lay.fmt == gg::kFmtMXFP4 || file_experts);
+    }
+    // device di's pool regions -> (layer, member) (-1: none)
+    std::vector<std::pair<int, int>> lend_regions(int di) const {
+        const core::VramPool* P = devs[(size_t) di].pool.get();
+        std::vector<std::pair<int, int>> v(P != nullptr ? (size_t) P->region_count() : 0, {-1, -1});
+        for (size_t li = 0; li < L.size(); ++li)
+            for (int m = 0; m < L[li].nm; ++m) {
+                const Layer& x = member(L[li], m);
+                if (P != nullptr && x.vp == P && x.vr >= 0 && x.vr < (int) v.size()) v[(size_t) x.vr] = {(int) li, m};
+            }
+        return v;
+    }
+    // device di's pool blocks as a lend sees them: a slot's region, whether it is the spare or a recent slot, whether a
+    // lend on another card has it, its expert's heat
+    void lend_view(int di, std::vector<lend::Block>& out, int& nr) const {
+        out.clear();
+        nr = 0;
+        const core::VramPool* P = devs[(size_t) di].pool.get();
+        if (P == nullptr) return;
+        const std::vector<std::pair<int, int>> reg = lend_regions(di);
+        nr = (int) reg.size();
+        std::vector<std::vector<int>> who(reg.size());   // a region's slot -> its expert (-1: empty)
+        for (size_t r = 0; r < reg.size(); ++r) {
+            if (reg[r].first < 0) continue;
+            const Layer& l = L[(size_t) reg[r].first];
+            who[r].assign((size_t) l.n_main, -1);
+            for (int e = 0; e < (int) l.slot.size(); ++e)
+                if (l.slot[(size_t) e] >= 0 && l.slot[(size_t) e] < l.n_main) who[r][(size_t) l.slot[(size_t) e]] = e;
+        }
+        for (int b = 0; b < P->block_count(); ++b) {
+            lend::Block B;
+            B.mapped = P->mapped(b);
+            for (const core::VramPool::Span& sp : P->block_slots(b)) {
+                const int li = reg[(size_t) sp.region].first;
+                if (li < 0) {
+                    B.foreign = true;
+                    continue;
+                }
+                const Layer& l = L[(size_t) li];
+                B.foreign = B.foreign || !lend_layer(l);
+                for (int s = sp.first; s < sp.first + sp.count; ++s) {
+                    const int e = who[(size_t) sp.region][(size_t) s];
+                    lend::Slot x;
+                    x.region = sp.region;
+                    x.fixed = s == l.spare_vram || (l.rc_n > 0 && s >= l.rc_base && s < l.rc_base + l.rc_n);
+                    x.live = l.lent_n.empty() || l.lent_n[(size_t) s] == 0;
+                    x.heat = e >= 0 && e < (int) l.heat.size() ? l.heat[(size_t) e] : 0.0f;
+                    B.slots.push_back(x);
+                }
+            }
+            out.push_back(std::move(B));
+        }
+    }
+    // a lend's table entries, in batches of kRcUpd through the tick's buffers (each device's stream waited for before a
+    // buffer is written again: a lend's entries may pass one tick's)
+    void lend_tables(const std::vector<std::vector<unsigned long long>>& upd) {
+        const bool bufs = tab_bufs();
+        for (size_t di = 0; di < devs.size() && di < upd.size(); ++di) {
+            const std::vector<unsigned long long>& u = upd[di];
+            if (u.empty()) continue;
+            cudaSetDevice(devs[di].id);
+            cudaStreamSynchronize(devs[di].st);   // (the last tick's entries read)
+            for (size_t i = 0; i < u.size(); i += (size_t) 2 * kRcUpd) {
+                const int n = (int) std::min<size_t>((u.size() - i) / 2, (size_t) kRcUpd);
+                if (bufs) {
+                    std::memcpy(rc_upd[di], u.data() + i, (size_t) n * 16);
+                    tab_set(rc_upd[di], n, devs[di].st);
+                } else {
+                    for (int k = 0; k < n; ++k)
+                        cudaMemcpyAsync((void*) u[i + 2 * (size_t) k], &u[i + 2 * (size_t) k + 1], 8,
+                                        cudaMemcpyHostToDevice, devs[di].st);
+                }
+                cudaStreamSynchronize(devs[di].st);
+            }
+        }
+    }
+    // the slots of device di's pool blocks `blocks` out of the slot tables: each expert in them to the CPU lane, read
+    // from the files as one the cache moves out (cache_switch), its table entries 0 on every member's device; then the
+    // card synchronized (cuMemUnmap does not wait for kernels).  The recent slots and the spare are never among them
+    // (lend::candidates), so rc_pin and the swaps' spare stay as they are
+    bool lend_take(int di, const std::vector<int>& blocks, std::string& err) {
+        const core::VramPool* P = devs[(size_t) di].pool.get();
+        if (P == nullptr || lent) {   // (a run of chunks has the tails: lends wait for its end)
+            err = P == nullptr ? "no expert pool" : "a prompt is running";
+            return false;
+        }
+        const std::vector<std::pair<int, int>> reg = lend_regions(di);
+        std::vector<std::vector<unsigned long long>> upd(devs.size());
+        std::vector<int> dropped;
+        for (int b : blocks)
+            for (const core::VramPool::Span& sp : P->block_slots(b)) {
+                const int li = reg[(size_t) sp.region].first;
+                if (li < 0) continue;
+                Layer& l = L[(size_t) li];
+                if (l.lent_n.empty()) l.lent_n.assign((size_t) l.n_main, 0);
+                dropped.clear();
+                lend::slots_out(l.slot, l.lent_n, l.lent_free, sp.first, sp.count, dropped);
+                for (int e : dropped) {
+                    if (l.lay.fmt == gg::kFmtMXFP4) {
+                        l.host[(size_t) e] = (uint8_t*) mx_mat(l, e, 0);
+                    } else {
+                        l.hh[(size_t) e] = {file_part(l, e), nullptr, nullptr, nullptr};
+                        l.host[(size_t) e] = l.hh[(size_t) e][0];
+                    }
+                    --l.n_vram;
+                    for (int m = 0; m < l.nm; ++m) {
+                        const Layer& x = member(l, m);
+                        upd[(size_t) x.dev].push_back((unsigned long long) (x.vram_tab + e));
+                        upd[(size_t) x.dev].push_back(0ull);
+                    }
+                }
+            }
+        lend_tables(upd);
+        cudaSetDevice(devs[(size_t) di].id);
+        const cudaError_t ce = cudaDeviceSynchronize();
+        if (ce != cudaSuccess) {
+            err = std::string("synchronizing CUDA") + std::to_string(devs[(size_t) di].id) + ": " + cudaGetErrorString(ce);
+            lend_put(di, blocks);   // (empty slots again: the cache fills them)
+            return false;
+        }
+        return true;
+    }
+    // the slots of device di's blocks `blocks` back (mapped again): a slot no card lends any more empty, on its
+    // layer's lent_free for the cache to fill (cache_queue)
+    void lend_put(int di, const std::vector<int>& blocks) {
+        const core::VramPool* P = devs[(size_t) di].pool.get();
+        if (P == nullptr) return;
+        const std::vector<std::pair<int, int>> reg = lend_regions(di);
+        for (int b : blocks)
+            for (const core::VramPool::Span& sp : P->block_slots(b)) {
+                const int li = reg[(size_t) sp.region].first;
+                if (li < 0 || L[(size_t) li].lent_n.empty()) continue;
+                Layer& l = L[(size_t) li];
+                lend::slots_back(l.lent_n, l.lent_free, sp.first, sp.count);
+            }
     }
 
     // lookahead's thread: the ranges the CPU lane asked for, read in (os::prefetch) off the lane, which computes
@@ -21271,5 +21437,53 @@ Model::Tiers Model::tiers() const {
     t.disk_gb = std::max(0, t.cpu - t.ram) * t.cpu_blob / 1e9;
     return t;
 }
+
+namespace {
+
+// the lender's view of the model (lend::Site): every card, by its device id; the work Impl's lend_* do
+class LendSite final : public lend::Site {
+public:
+    explicit LendSite(Model::Impl& m) : m_(m) {}
+    std::vector<int> cards() override {
+        std::vector<int> v;
+        for (const Dev& d : m_.devs) v.push_back(d.id);
+        return v;
+    }
+    core::VramPool* pool(int dev) override {
+        const int di = index(dev);
+        return di >= 0 ? m_.devs[(size_t) di].pool.get() : nullptr;
+    }
+    void quiesce() override { m_.cache_drain(); }
+    void view(int dev, std::vector<lend::Block>& blocks, int& n_regions) override {
+        blocks.clear();
+        n_regions = 0;
+        const int di = index(dev);
+        if (di >= 0) m_.lend_view(di, blocks, n_regions);
+    }
+    bool take(int dev, const std::vector<int>& blocks, std::string& err) override {
+        const int di = index(dev);
+        if (di < 0) {
+            err = "no CUDA" + std::to_string(dev);
+            return false;
+        }
+        return m_.lend_take(di, blocks, err);
+    }
+    void put(int dev, const std::vector<int>& blocks) override {
+        const int di = index(dev);
+        if (di >= 0) m_.lend_put(di, blocks);
+    }
+
+private:
+    int index(int dev) const {
+        for (size_t di = 0; di < m_.devs.size(); ++di)
+            if (m_.devs[di].id == dev) return (int) di;
+        return -1;
+    }
+    Model::Impl& m_;
+};
+
+}  // namespace
+
+std::unique_ptr<core::VramLender> Model::lender() { return std::make_unique<lend::Lender>(std::make_unique<LendSite>(*p_)); }
 
 }  // namespace strata::ds4

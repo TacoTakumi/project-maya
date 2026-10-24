@@ -465,6 +465,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(vram_pool_test PRIVATE strata_core ${_strata_gpu_runtime_target})
     add_test(NAME vram_pool_test COMMAND vram_pool_test)
     set_tests_properties(vram_pool_test PROPERTIES TIMEOUT 120)
+    # DeepSeek's lend of that pool (src/ds4/ds4_lend.cu): the block choice, the slot tables, and the lender over a real
+    # pool and a made-up cache (needs a GPU with ~2 GiB free, no model; STRATA_TEST_DEV picks the card)
+    add_executable(ds4_lend_test tests/ds4_lend_test.cu src/ds4/ds4_lend.cu)
+    target_include_directories(ds4_lend_test PRIVATE src/ds4)
+    target_link_libraries(ds4_lend_test PRIVATE strata_core strata_lend ${_strata_gpu_runtime_target})
+    add_test(NAME ds4_lend_test COMMAND ds4_lend_test)
+    set_tests_properties(ds4_lend_test PROPERTIES TIMEOUT 120)
   endif()
   # the batched rows' one-launch kernels (hc_rows, kda_layers over the rows, mv_nt) against the per-row kernels, bitwise
   # (random inputs, no model)
@@ -661,7 +668,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(maya-ds4 src/ds4/ds4_main.cpp src/ds4/ds4_model.cu src/ds4/ds4_kernels.cu src/ds4/ds4_vision.cu
                               src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp
-                              src/ds4/ds4_lt.cu src/ds4/ds4_host_ar.cpp src/ds4/ds4_packinfo.cpp)
+                              src/ds4/ds4_lt.cu src/ds4/ds4_host_ar.cpp src/ds4/ds4_packinfo.cpp src/ds4/ds4_lend.cu)
     target_include_directories(maya-ds4 PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
     # the commit and the release `maya-ds4 --version` and --verbose name, written at every build (cmake/build_id.cmake:
     # git's commit, a source archive's BUILD_ID file, or -DMAYA_BUILD_ID=...; the release from VERSION)

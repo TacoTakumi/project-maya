@@ -17,12 +17,104 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "strata/core/vram_lend.hpp"
+
+namespace strata::core {
+class VramPool;
+}
+
 namespace strata::ds4 {
+
+/// Lending the experts' VRAM to another program (the shared lend commands, strata/core/vram_lend.hpp): a card's
+/// expert pool (core::VramPool) as a lend sees it, the choice of its blocks, and the lender over an engine's cache
+/// (ds4_lend.cu).  A lend takes whole pool blocks: every slot in them leaves the cache's slot table (its expert goes to
+/// the CPU lane, as one the cache moves out), the card is synchronized and the blocks unmapped.  A return maps them
+/// back; their slots come back empty, and the cache fills them with the experts the decode misses.
+namespace lend {
+
+/// The slots a layer keeps on a card beyond its swap spare and its recent slots, which a lend never takes: the
+/// engine's own floor - a cached layer runs on one VRAM slot and the spare (place_experts: a cache needs two slots, the
+/// prompt path's tail leaves a layer one).
+constexpr int kKeep = 1;
+
+/// A slot of a pool block: its region (a layer's member on the card), whether a lend must leave it (the cache's swap
+/// spare, a recent slot), whether it can hold an expert now (false: a lend on another card has its block), and the
+/// heat of the expert in it (0: empty).
+struct Slot {
+    int region = 0;
+    bool fixed = false, live = true;
+    float heat = 0.0f;
+};
+/// A block of the pool: mapped (false: lent), foreign when it holds a slot of a layer that cannot lend, its slots.
+struct Block {
+    bool mapped = true, foreign = false;
+    std::vector<Slot> slots;
+};
+
+/// The blocks a lend may take: mapped, not foreign, no fixed slot, and not among those that keep each region `keep`
+/// live slots (beyond the fixed ones): a region short of them keeps its hottest blocks.  In block order.
+std::vector<int> candidates(const std::vector<Block>& blocks, int n_regions, int keep);
+/// The lendable rule's inputs over a card's blocks, and its answer (core::lendable_bytes): the pool is the mapped
+/// blocks of the layers that lend, the minimum the blocks of them a lend must leave (`n_cand` of them it may take).
+/// The prompt path's borrow is 0: DeepSeek's prompt path borrows Dev::tail, an allocation of its own outside the pool.
+struct Figures {
+    size_t pool = 0, min = 0, lendable = 0;
+};
+Figures figures(const std::vector<Block>& blocks, size_t n_cand, size_t block_bytes);
+/// `n` of the candidates (at most all): spread evenly over the regions - the next block the one whose regions gave
+/// least so far - and of those the coldest (its experts' heat summed; empty slots 0), then the lowest index.
+std::vector<int> pick(const std::vector<Block>& blocks, const std::vector<int>& cand, int n);
+
+/// A layer's slot table as a lend changes it.  slots_out: slots [first, first + count) out of use (a card lent their
+/// block) - each expert in them out of `slot` (expert -> slot, -1: none) into `dropped`, each slot's lent count `out`
+/// up and the slot off the `free` list.  slots_back: their lent count down; a slot no card lends any more goes on
+/// `free` (empty, for the cache to fill).
+void slots_out(std::vector<int>& slot, std::vector<int>& out, std::vector<int>& free, int first, int count,
+               std::vector<int>& dropped);
+void slots_back(std::vector<int>& out, std::vector<int>& free, int first, int count);
+
+/// What the lender needs of the engine, from the thread that runs the windows and between them.
+class Site {
+public:
+    virtual ~Site() = default;
+    virtual std::vector<int> cards() = 0;                 // the cards with a pool (device ids), in order
+    virtual core::VramPool* pool(int dev) = 0;            // that card's pool (null: none)
+    virtual void quiesce() = 0;                           // the cache's moves under way landed, none started
+    virtual void view(int dev, std::vector<Block>& blocks, int& n_regions) = 0;
+    /// The blocks' slots out of the slot tables (their experts to the CPU lane), the tables on the devices, and the
+    /// card synchronized: nothing runs on the blocks any more.  False and err: refused, nothing changed.
+    virtual bool take(int dev, const std::vector<int>& blocks, std::string& err) = 0;
+    virtual void put(int dev, const std::vector<int>& blocks) = 0;   // the blocks' slots back (mapped again), empty
+};
+
+/// The VramLender over a Site: lend() quiesces, picks the blocks, takes them out of the cache and unmaps them; the
+/// lease's token names that block set.  give_back() maps them (Busy: the lease stays) and puts the slots back.
+class Lender : public core::VramLender {
+public:
+    explicit Lender(std::unique_ptr<Site> site, int keep = kKeep) : site_(std::move(site)), keep_(keep) {}
+    std::vector<core::LendCard> lend_cards() override;
+    core::LendResult lend(int dev, std::size_t mib) override;
+    core::GiveBack give_back(int dev, std::uint64_t token) override;
+    Site& site() { return *site_; }
+
+private:
+    struct Out {
+        int dev = 0;
+        std::vector<int> blocks;
+    };
+    std::unique_ptr<Site> site_;
+    int keep_ = kKeep;
+    std::map<std::uint64_t, Out> out_;   // by token
+    std::uint64_t next_ = 1;
+};
+
+}  // namespace lend
 
 struct Options {
     std::string pack;                 // <model>/maya-ds4
@@ -372,6 +464,11 @@ public:
         double disk_gb = 0;   // the CPU lane's experts neither copied nor read ahead into RAM: on the SSD only
     };
     Tiers tiers() const;
+
+    /// A lender of the experts' pool for the shared lend commands (core::LendCommands), one for the life of the model
+    /// (after load()).  Its calls run on the thread that feeds and steps, between them (never during a feed(), step(),
+    /// draft() or verify()); a card lends nothing where its layers cannot (no VMM pool, no cache, every expert in VRAM).
+    std::unique_ptr<core::VramLender> lender();
 
     struct Impl;
 
