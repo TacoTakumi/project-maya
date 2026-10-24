@@ -39,6 +39,7 @@
 #include "ds4_ram_slice.hpp"
 #include "ds4_store.hpp"
 #include "ds4_vision.cuh"
+#include "strata/core/vram_pool.hpp"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/exl3.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -597,6 +598,8 @@ struct Dev {
     // each hold of the tensors they do not split - what tensor parallel costs beyond one copy, its members' share)
     size_t prompt = 0, tp_w = 0;
     std::vector<void*> allocs;
+    // the cached layers' main expert slots on this device (Layer::vp): blocks of whole slots, laid out once at load
+    std::unique_ptr<core::VramPool> pool;
     // a window's scratch, rows of up to kWin tokens (the routed experts' rows: kWin * kPicks)
     float *h = nullptr, *h2 = nullptr, *x = nullptr, *qr = nullptr, *q = nullptr, *kvr = nullptr, *ckr = nullptr,
           *cgr = nullptr, *latent = nullptr, *ikr = nullptr, *iq = nullptr, *iw = nullptr, *scores = nullptr,
@@ -906,6 +909,10 @@ struct Layer {
     // vram_base, [n_main, n_slots) in the tail region, xstep apart from xbase; pv_n: a run's VRAM slots - those past it
     // lie under the run's buffers (their experts streamed in like the CPU lane's, read back after it) - n_slots outside
     int n_main = 0, pv_n = 0;
+    // (a member's own allocation: region vr of its device's pool vp - slot s at vp->slot_ptr(vr, s), not vram_base +
+    // s * unit in general (a block holds whole slots); vram_base is slot 0's)
+    const core::VramPool* vp = nullptr;
+    int vr = -1;
     uint8_t* xbase = nullptr;
     size_t xstep = 0;
     // a prompt read in parts that keeps its lend between them (lend_hold): expert -> 1 while its slot lies under the
@@ -2293,6 +2300,10 @@ struct Model::Impl {
         if (rc_th.joinable()) rc_th.join();
         for (Dev& d : devs) {
             cudaSetDevice(d.id);
+            if (d.pool) {   // (its blocks unmapped: nothing may still run on them)
+                cudaDeviceSynchronize();
+                d.pool.reset();
+            }
             for (void* p : d.allocs) cudaFree(p);
             if (d.st) cudaStreamDestroy(d.st);
             if (d.ev) cudaEventDestroy(d.ev);
@@ -2368,10 +2379,12 @@ struct Model::Impl {
         const auto on = [](const char* v) { return v != nullptr && std::atoi(v) != 0; };
         return on(ds4_env("DS4_TP_BORROW")) && on(std::getenv("DS4_FLOW_TP"));
     }
-    // VRAM slot s of layer l, member x's part of it: u bytes a slot in its own allocation, the tail's xstep apart
+    // VRAM slot s of layer l, member x's part of it: in its region of the device's pool (u bytes a slot), the tail's
+    // xstep apart
     static uint8_t* sat(const Layer& l, const Layer& x, int s, size_t u) {
         if (!l.maddr.empty()) return l.maddr[(size_t) s];   // (a mixed layer: slot s = expert s, in its class's arena)
-        return s < l.n_main ? x.vram_base + (size_t) s * u : x.xbase + (size_t) (s - l.n_main) * x.xstep;
+        if (s < l.n_main) return x.vp != nullptr ? x.vp->slot_ptr(x.vr, s) : x.vram_base + (size_t) s * u;
+        return x.xbase + (size_t) (s - l.n_main) * x.xstep;
     }
     // the members of a group of nm that take heads: the most the heads and the wo_a groups split among evenly (64
     // heads and 8 groups: 9 -> 8, 7 or 6 -> 4, 5 -> 4, 3 -> 2); the first members the rest, only their FFN share
@@ -6039,11 +6052,22 @@ struct Model::Impl {
     }
 
     // a run's VRAM experts [i0, i1) of layer L0 (its own slots, then the tail's it kept: their blobs at member x's
-    // vram_base and xbase), through run_set with layer l's layout
+    // vram_base and xbase), through run_set with layer l's layout - its own slots a pool block's at a time where a
+    // block's end breaks their stride
     bool run_vram(Dev& d, Chunk& c, const Layer& L0, const Layer& l, const Layer& x, const int* b, int i0, int i1, int T,
                   std::string& err) {
         const int m = std::min(i1, L0.n_main), t0 = std::max(i0, L0.n_main);
-        if (i0 < m && !run_set(d, c, l, x.vram_base, 0, unit(x), c.bounds, b, i0, m, T, err)) return false;
+        if (x.vp == nullptr) {   // (a mixed layer: its arenas, run_set finds each expert by its address)
+            if (i0 < m && !run_set(d, c, l, x.vram_base, 0, unit(x), c.bounds, b, i0, m, T, err)) return false;
+        } else {
+            const bool lin = x.vp->linear(x.vr);
+            const core::VramPool::RegionLayout& R = x.vp->region(x.vr);
+            for (int s = i0; s < m;) {
+                const int e = lin ? m : std::min(m, s + R.per_block - (R.first_pos + s) % R.per_block);
+                if (!run_set(d, c, l, x.vp->slot_ptr(x.vr, s), s, unit(x), c.bounds, b, s, e, T, err)) return false;
+                s = e;
+            }
+        }
         return t0 >= i1 || run_set(d, c, l, x.xbase, L0.n_main, x.xstep, c.bounds, b, t0, i1, T, err);
     }
     // the experts [i0, i1) of a sorted set (blobs at wbase + i * stride; bounds b on the host, d_bounds on the device)
@@ -6524,6 +6548,68 @@ struct Model::Impl {
                      v, where.c_str());
         return true;
     }
+    // what the pool (core::VramPool) costs member mi of group gi beyond its slots' bytes: a block holds whole slots, so a
+    // slot takes `factor` times its bytes (at the block size, of those the pool picks from, that loses least for every
+    // slot size the member holds), and each slot size's last block may be partly used (`partial` bytes in all) - an
+    // upper bound of the pool's own pick, which wastes least for the slots it gets
+    void pool_cost(int gi, size_t mi, double& factor, double& partial) const {
+        factor = 1.0;
+        partial = 0.0;
+        const size_t nm = groups[(size_t) gi].mem.size();
+        const int dv = groups[(size_t) gi].mem[mi];
+        std::vector<size_t> sizes;   // (the member's slot sizes, as trim_to_fit counts its bytes)
+        for (const Layer& l : L) {
+            if (l.grp != gi || l.n_cls > 1) continue;
+            const size_t u = (size_t) l.nm == nm ? unit(member(l, (int) mi)) : l.nm == 1 && l.dev == dv ? l.blob : 0;
+            if (u > 0) sizes.push_back(u);
+        }
+        if (sizes.empty()) return;
+        std::sort(sizes.begin(), sizes.end());
+        sizes.erase(std::unique(sizes.begin(), sizes.end()), sizes.end());
+        size_t gran = 0;
+        core::VramPool::vmm_supported(devs[(size_t) dv].id, &gran);
+        const core::VramPool::Options po;
+        const size_t lo = std::max((sizes.back() + gran - 1) / gran, (po.min_block_bytes + gran - 1) / gran);
+        const size_t hi = std::max(lo, po.max_block_bytes / gran);
+        size_t block = 0;
+        for (size_t m = lo; m <= hi; ++m) {
+            double f = 1.0;
+            for (size_t u : sizes) f = std::max(f, (double) (m * gran) / (double) (m * gran / u * u));
+            if (block == 0 || f < factor) factor = f, block = m * gran;
+        }
+        partial = (double) sizes.size() * (double) block;
+    }
+    // the main slots ([0, n_main)) of the layers not mixed in one pool a device, laid out once: a region a layer's
+    // member there, the slot sizes side by side (one size's regions share blocks), in layer order within a size
+    bool pool_slots(std::string& err) {
+        for (size_t di = 0; di < devs.size(); ++di) {
+            Dev& d = devs[di];
+            std::vector<std::pair<Layer*, int>> xs;   // (a member on this device, its layer's main slots)
+            for (Layer& l : L)
+                if (l.n_cls == 1 && l.n_main > 0)
+                    for (int m = 0; m < l.nm; ++m)
+                        if (member(l, m).dev == (int) di) xs.push_back({&member(l, m), l.n_main});
+            if (xs.empty()) continue;
+            std::stable_sort(xs.begin(), xs.end(), [](const std::pair<Layer*, int>& a, const std::pair<Layer*, int>& b) {
+                return unit(*a.first) < unit(*b.first);
+            });
+            std::vector<core::VramPoolRegion> rg;
+            for (const auto& x : xs) rg.push_back({unit(*x.first), x.second});
+            core::VramPool::Options po;
+            po.tag = "ds4";
+            auto pool = std::make_unique<core::VramPool>();
+            if (!pool->create(d.id, rg, po, err)) return false;
+            for (size_t r = 0; r < xs.size(); ++r) {
+                Layer& x = *xs[r].first;
+                x.vp = pool.get();
+                x.vr = (int) r;
+                x.vram_base = pool->slot_ptr((int) r, 0);
+            }
+            d.experts += pool->bytes();
+            d.pool = std::move(pool);
+        }
+        return true;
+    }
 
     // the most VRAM experts layer l keeps: a DSpark block DS4_DRAFT_VRAM's (draft_caps), every other layer all
     int vram_cap(const Layer& l) const {
@@ -6717,6 +6803,14 @@ struct Model::Impl {
                     mroom[0] -= b;
                     l.n_vram = l.n_exp;
                 }
+            // the other layers' slots go in the device's pool, whose blocks hold whole slots: each member's room less
+            // what the blocks' unused ends take (pool_cost)
+            for (size_t mi = 0; mi < mroom.size(); ++mi) {
+                double f = 1.0, part = 0.0;
+                pool_cost((int) gi, mi, f, part);
+                mroom[mi] = std::max(0.0, mroom[mi] - part) / f;
+                own[mi] = std::max(0.0, own[mi] - part) / f;
+            }
             // the drafter's experts first (every draft uses its blocks) - a block is its member's alone (the lead's,
             // unless DS4_DRAFT_DEV names another), so it takes that member's room; the trunk's layers then what the
             // tightest member has left
@@ -7022,6 +7116,42 @@ struct Model::Impl {
             }
         }
         for (Layer& l : L) {
+            if (l.n_cls > 1) continue;   // (a mixed layer: every expert in VRAM, below)
+            // a layer with experts on both sides keeps one VRAM slot free for the cache's swaps
+            l.n_slots = std::min(l.n_vram, l.n_exp);
+            if (o.expert_cache && l.n_slots >= 2 && l.n_slots < l.n_exp) {   // (every expert fits: nothing to swap)
+                const int r = recent_n > 0 && !l.mtp && (!file_experts || (pk.gguf && ln_land)) &&
+                                      l.n_slots - 1 - recent_n >= 1 ? recent_n : 0;
+                l.n_vram = l.n_slots - 1 - r;   // (the recent slots: [n_vram, n_vram + r), from the profile's coldest)
+                l.spare_vram = l.n_slots - 1;
+                l.rc_base = l.n_vram;
+                l.rc_n = r;
+                // (an EXL3 lender: the spare first, the recent slots last - the lent tail the recent slots alone, whose
+                //  experts are copies of RAM's; a swap's spare moves among the layer's own slots and never into the tail,
+                //  where the expert it takes in - its RAM copy given up - could not stream while the slot is lent)
+                const Chunk* lc = (size_t) l.dev < chunks.size() ? chunks[(size_t) l.dev].get() : nullptr;
+                if (r > 0 && !l.mtp && lc != nullptr && lc->x3_lend) {
+                    l.spare_vram = l.n_vram;
+                    l.rc_base = l.n_vram + 1;
+                }
+            } else {
+                l.n_vram = l.n_slots;
+                l.spare_vram = -1;
+            }
+            // (the last n_tail slots - the coldest of them, and the cache's spare - in the device's tail region)
+            l.n_main = l.n_slots - std::min(l.n_slots, n_tail[(size_t) (&l - &L[0])]);
+            l.pv_n = l.n_slots;
+            // (DS4_EXL3_LEND: the tail the cache's slots alone - an expert placed there has no copy in RAM to stream from)
+            if ((l.rc_n == 0 || l.n_main < l.rc_base) && l.n_main < l.n_slots && !l.mtp && chunks.size() > (size_t) l.dev &&
+                chunks[(size_t) l.dev] != nullptr && chunks[(size_t) l.dev]->x3_lend) {
+                err = "DS4_EXL3_LEND: layer " + std::to_string(l.il) + " keeps " + std::to_string(l.rc_n) +
+                      " recent slots, its tail " + std::to_string(l.n_slots - l.n_main) +
+                      " - fewer VRAM experts a layer than the lend needs (a smaller --prefill-chunk, or DS4_EXL3_LEND=0)";
+                return false;
+            }
+        }
+        if (!pool_slots(err)) return false;
+        for (Layer& l : L) {
             // the hottest experts of the profile first, then by index
             std::vector<int> order((size_t) l.n_exp);
             std::iota(order.begin(), order.end(), 0);
@@ -7076,53 +7206,7 @@ struct Model::Impl {
                 }
                 continue;
             }
-            // a layer with experts on both sides keeps one VRAM slot free for the cache's swaps
-            l.n_slots = std::min(l.n_vram, l.n_exp);
-            if (o.expert_cache && l.n_slots >= 2 && l.n_slots < l.n_exp) {   // (every expert fits: nothing to swap)
-                const int r = recent_n > 0 && !l.mtp && (!file_experts || (pk.gguf && ln_land)) &&
-                                      l.n_slots - 1 - recent_n >= 1 ? recent_n : 0;
-                l.n_vram = l.n_slots - 1 - r;   // (the recent slots: [n_vram, n_vram + r), from the profile's coldest)
-                l.spare_vram = l.n_slots - 1;
-                l.rc_base = l.n_vram;
-                l.rc_n = r;
-                // (an EXL3 lender: the spare first, the recent slots last - the lent tail the recent slots alone, whose
-                //  experts are copies of RAM's; a swap's spare moves among the layer's own slots and never into the tail,
-                //  where the expert it takes in - its RAM copy given up - could not stream while the slot is lent)
-                const Chunk* lc = (size_t) l.dev < chunks.size() ? chunks[(size_t) l.dev].get() : nullptr;
-                if (r > 0 && !l.mtp && lc != nullptr && lc->x3_lend) {
-                    l.spare_vram = l.n_vram;
-                    l.rc_base = l.n_vram + 1;
-                }
-            } else {
-                l.n_vram = l.n_slots;
-                l.spare_vram = -1;
-            }
             for (int i = 0; i < l.n_vram; ++i) l.slot[(size_t) order[(size_t) i]] = i;
-            // (the last n_tail slots - the coldest of them, and the cache's spare - in the device's tail region)
-            l.n_main = l.n_slots - std::min(l.n_slots, n_tail[(size_t) (&l - &L[0])]);
-            l.pv_n = l.n_slots;
-            // (DS4_EXL3_LEND: the tail the cache's slots alone - an expert placed there has no copy in RAM to stream from)
-            if ((l.rc_n == 0 || l.n_main < l.rc_base) && l.n_main < l.n_slots && !l.mtp && chunks.size() > (size_t) l.dev &&
-                chunks[(size_t) l.dev] != nullptr && chunks[(size_t) l.dev]->x3_lend) {
-                err = "DS4_EXL3_LEND: layer " + std::to_string(l.il) + " keeps " + std::to_string(l.rc_n) +
-                      " recent slots, its tail " + std::to_string(l.n_slots - l.n_main) +
-                      " - fewer VRAM experts a layer than the lend needs (a smaller --prefill-chunk, or DS4_EXL3_LEND=0)";
-                return false;
-            }
-            for (int m = 0; m < l.nm && l.n_main > 0; ++m) {
-                Layer& x = member(l, m);
-                Dev& d = devs[(size_t) x.dev];
-                cudaSetDevice(d.id);
-                void* v = nullptr;
-                if (cudaMalloc(&v, (size_t) l.n_main * unit(x)) != cudaSuccess) {
-                    err = "cudaMalloc of layer " + std::to_string(l.il) + "'s " + std::to_string(l.n_main) +
-                          " experts on CUDA" + std::to_string(d.id) + " failed";
-                    return false;
-                }
-                d.allocs.push_back(v);
-                d.experts += (size_t) l.n_main * unit(x);
-                x.vram_base = (uint8_t*) v;
-            }
             l.heat.assign((size_t) l.n_exp, 0.0f);
             {   // the profile as the starting heat: its counts scaled to ~512 hits a layer
                 double sum = 0;
