@@ -315,6 +315,21 @@ target_link_libraries(strata_plan INTERFACE strata_warnings)
 add_executable(strata-plan src/plan/plan_main.cpp)
 target_link_libraries(strata-plan PRIVATE strata_plan)
 
+# ---- strata_lend ----------------------------------------------------------
+# Lending a card's expert-cache memory out on request: the control-line commands (LEND, RETURN, LENDABLE), the lease
+# table and the lendable rule.  Shared by both engines - each implements the VramLender interface over its own cache -
+# and plain C++, so it builds (and its test runs) without a GPU toolkit.
+add_library(strata_lend STATIC src/core/vram_lend.cpp)
+target_include_directories(strata_lend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(strata_lend PRIVATE strata_warnings)
+if(STRATA_BUILD_TESTS)
+  enable_testing()
+  add_executable(vram_lend_test tests/vram_lend_test.cpp)
+  target_link_libraries(vram_lend_test PRIVATE strata_lend strata_warnings)
+  add_test(NAME vram_lend_test COMMAND vram_lend_test)
+  set_tests_properties(vram_lend_test PROPERTIES TIMEOUT 60)
+endif()
+
 # ---- strata_core (GPU runtime) ---------------------------------------------
 # Only built when a GPU backend is on, so the Phase 1 targets keep working without a toolkit.
 if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
@@ -546,7 +561,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/glm_model.cu src/core/glm_fast_path.cu src/core/glm_prefill.cu src/core/glm_multi.cu src/core/glm_rows.cu
     src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_mtp.cu src/core/glm_mtp_rows.cu)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu strata_lend
+                        ${_strata_gpu_runtime_target})
   if(WIN32 AND STRATA_ENABLE_CUDA)
     target_link_libraries(strata_engine PRIVATE dxgi)
   endif()
@@ -647,7 +663,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       VERBATIM)
     add_dependencies(maya-ds4 maya_build_id)
     target_include_directories(maya-ds4 PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
-    target_link_libraries(maya-ds4 PRIVATE strata_kernels strata_kernels_cpu strata_spec ${_strata_gpu_runtime_target}
+    target_link_libraries(maya-ds4 PRIVATE strata_kernels strata_kernels_cpu strata_spec strata_lend ${_strata_gpu_runtime_target}
                           ${_strata_gpu_blas_target})
     if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)   # (the prompt path's dense GEMMs: ds4_lt.cu)
       set_source_files_properties(src/ds4/ds4_lt.cu PROPERTIES COMPILE_DEFINITIONS STRATA_HIPBLASLT_AVAILABLE=1)
