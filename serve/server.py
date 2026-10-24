@@ -1049,9 +1049,8 @@ class StrataEngine:
             self._context_cost(log_start)
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
         self.lines: queue.Queue = queue.Queue()
-        self._lend_lines: queue.Queue = queue.Queue()   # the answers to the lend commands (lend_command)
-        self._lend_lock = threading.Lock()
-        threading.Thread(target=self._pump, args=(self.proc, self.lines, self._lend_lines), daemon=True).start()
+        self._lend_calls = vram_lend.Calls(self.proc.stdin)   # the lend commands sent, not answered yet (lend_command)
+        threading.Thread(target=self._pump, args=(self.proc, self.lines, self._lend_calls), daemon=True).start()
 
     def _context_cost(self, offset: int):
         """What this start's context costs in VRAM, from the GLM engine's own start lines ("CUDA0 VRAM before the
@@ -1096,14 +1095,14 @@ class StrataEngine:
         self.ended = True
         wait_gpu_release(self.proc.pid)
 
-    def _pump(self, proc=None, lines=None, lend_lines=None):
-        # This start's process and line queues: a later start (restart) has its own.  An engine's output can close
-        # well after a new one started - GLM's link mode: the AMD GPU's helper program shares the lead's output and
-        # ends a little after it - and that late end must not mark the NEW engine ended (every request then started
+    def _pump(self, proc=None, lines=None, lend_calls=None):
+        # This start's process, line queue and lend calls: a later start (restart) has its own.  An engine's output can
+        # close well after a new one started - GLM's link mode: the AMD GPU's helper program shares the lead's output
+        # and ends a little after it - and that late end must not mark the NEW engine ended (every request then started
         # the engine again, about a minute each)
         proc = proc if proc is not None else self.proc
         lines = lines if lines is not None else self.lines
-        lend_lines = lend_lines if lend_lines is not None else self._lend_lines
+        lend_calls = lend_calls if lend_calls is not None else self._lend_calls
         for line in proc.stdout:
             if proc is not self.proc:                   # replaced: what is left of its output is nobody's
                 continue
@@ -1120,16 +1119,17 @@ class StrataEngine:
                 self.ended = True
                 continue
             if vram_lend.is_answer(line):               # (they come while requests run: never a request's lines)
-                lend_lines.put(line)
+                lend_calls.answer(line)
                 continue
             if self.multi and self._route(line):
                 continue
             lines.put(line)
         if proc is not self.proc:                       # an engine already replaced: the running one is not ended
+            lend_calls.close()                          # (its lend commands still out: nobody answers them now)
             return
         self.ended = True                               # its output closed: it is gone, even before the OS says so
         lines.put(None)
-        lend_lines.put(None)
+        lend_calls.close()
         with self._routes_lock:
             for q in self._routes.values():
                 q.put(None)
@@ -1660,35 +1660,27 @@ class StrataEngine:
             else:
                 return                                  # (not this request's end: dropped, as before)
 
-    def lend_command(self, line: str, timeout: float = 30.0) -> list[str]:
+    def lend_command(self, line: str, timeout: float = 30.0, then=None) -> list[str]:
         """A lend command (LEND / RETURN / LENDABLE, serve/vram_lend.py) -> its answer lines, also while requests run:
-        the engine takes them between its steps, and the answers come back on their own queue (_pump), so neither the
-        service's FIFO nor a request's lines are involved.  One at a time (the answers carry no request id); ValueError
-        when the engine does not answer in `timeout`."""
-        with self._lend_lock:
-            q = self._lend_lines
-            while True:                                 # an answer that came after its command gave up: not this one's
-                try:
-                    if q.get_nowait() is None:
-                        raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
-                except queue.Empty:
-                    break
-            try:
-                self.proc.stdin.write(line + "\n")
-                self.proc.stdin.flush()
-            except (OSError, ValueError):
-                raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
-            got, end = [], time.monotonic() + timeout
-            while True:
-                try:
-                    a = q.get(timeout=max(0.1, end - time.monotonic()))
-                except queue.Empty:
-                    raise ValueError(f"the engine did not answer {line.split()[0]}") from None
-                if a is None:
-                    raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
-                got.append(a.strip())
-                if vram_lend.last_line(a):
-                    return got
+        the engine takes them between its steps, and the answers come back through their own table (_pump), so neither
+        the service's FIFO nor a request's lines are involved.  `then(lines, waited)` runs on the line reader's thread
+        as the answer comes (vram_lend.Calls).  ValueError when the engine does not answer in `timeout`: the command
+        stays sent, and its answer goes to `then` (waited False) when it comes - never to a later command."""
+        calls = self._lend_calls
+        call = calls.send(line, then)
+        if call is None:
+            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+        if not calls.wait(call, timeout):
+            raise ValueError(f"the engine did not answer {line.split()[0]} in {timeout:g} s")
+        if call.got is None:
+            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+        return call.got
+
+    def lend_post(self, line: str, then):
+        """A lend command nobody waits for: its answer goes to `then(lines, False)` on the line reader's thread (not
+        at all when the engine ends first)."""
+        if self._lend_calls.send(line, then, waited=False) is None:
+            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
 
     def wrap(self):
         """The server is stopping: a request still thinking closes its reasoning at the next token and answers."""
