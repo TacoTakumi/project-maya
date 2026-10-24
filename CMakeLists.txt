@@ -328,6 +328,14 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(vram_lend_test PRIVATE strata_lend strata_warnings)
   add_test(NAME vram_lend_test COMMAND vram_lend_test)
   set_tests_properties(vram_lend_test PROPERTIES TIMEOUT 60)
+  # maya-ds4's control-line routing (src/ds4/ds4_lines.hpp): lend lines queued for the main thread, STOP and the
+  # requests as before - header-only and plain C++, no model, no GPU
+  find_package(Threads REQUIRED)
+  add_executable(ds4_lines_test tests/ds4_lines_test.cpp)
+  target_include_directories(ds4_lines_test PRIVATE src/ds4)
+  target_link_libraries(ds4_lines_test PRIVATE strata_lend strata_warnings Threads::Threads)
+  add_test(NAME ds4_lines_test COMMAND ds4_lines_test)
+  set_tests_properties(ds4_lines_test PROPERTIES TIMEOUT 60)
 endif()
 
 # ---- strata_core (GPU runtime) ---------------------------------------------

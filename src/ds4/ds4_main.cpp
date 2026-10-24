@@ -7,7 +7,8 @@
 // --serve speaks what serve/server.py's StrataEngine expects: INFO lines, then `READY <context> stop`; per request
 // `GEN <max_new> [key=value ...] <id,id,...>` answered by `T <id>` lines and `DONE <generated> <prompt> <prompt ms>
 // <decode ms> <stop|length|cancel> <accepted> <offered> <reused> <hits> <lookups>` (the drafts; the decode's routed
-// experts in VRAM / all); `STOP` ends a request early, `QUIT` the engine.  A prompt that
+// experts in VRAM / all); `STOP` ends a request early, `QUIT` the engine.  `LEND`, `RETURN` and `LENDABLE` lend the
+// experts' VRAM out and take it back (include/strata/core/vram_lend.hpp), also while a request runs.  A prompt that
 // continues the state (the conversation so far) reuses it; one that only shares the last prompt's start goes back to
 // that prompt's end; anything else starts over.  `GENI <max_new> [keys] <file> <ids>` carries the prompt's pictures
 // (the file: see read_pics); the state is shared only where the same picture sits at the same place.  With
@@ -26,6 +27,7 @@
 #include "ds4_marks.hpp"
 #include "ds4_gguf.cuh"       // (--pack-info: the types the kernels take, asked of them)
 #include "ds4_iq.cuh"
+#include "ds4_lines.hpp"
 #include "ds4_model.hpp"
 #include "ds4_packinfo.hpp"
 #include "ds4_watchdog.hpp"
@@ -159,85 +161,6 @@ strata::ds4::KernelTypes kernel_types() {
     kt.exl3_k2 = [](int k2) { return strata::kernels::exl3::k2_supported(k2, 2); };
     return kt;
 }
-
-// stdin lines on a thread, so a request can see STOP while it decodes.  read(2), not std::cin - glibc's exit()
-// flushes stdio and waits on stdin's lock, which getline holds while it waits for input (the GLM serve's pattern)
-struct Lines {
-    std::mutex mu;
-    std::condition_variable cv;
-    std::deque<std::string> q;
-    bool eof = false;
-    std::atomic<bool> stop{false};
-    // --parallel: `STOP <rid>` ends that request alone (stop_rids), a bare STOP, QUIT or the input's end all of them
-    std::vector<long long> stop_rids;
-    std::atomic<bool> stop_all{false};
-    bool stopped(long long rid) {
-        if (stop_all.load()) return true;
-        std::lock_guard<std::mutex> lk(mu);
-        return std::find(stop_rids.begin(), stop_rids.end(), rid) != stop_rids.end();
-    }
-    void forget(long long rid) {   // (the request is over: a late STOP of it changes nothing)
-        std::lock_guard<std::mutex> lk(mu);
-        stop_rids.erase(std::remove(stop_rids.begin(), stop_rids.end(), rid), stop_rids.end());
-    }
-    void start() {
-        std::thread([this] {
-            std::string l, buf;
-            char chunk[4096];
-            auto getline_fd = [&](std::string& out) -> bool {
-                for (;;) {
-                    const size_t nlpos = buf.find('\n');
-                    if (nlpos != std::string::npos) {
-                        out.assign(buf, 0, nlpos);
-                        buf.erase(0, nlpos + 1);
-                        return true;
-                    }
-#if defined(_WIN32)
-                    const int n = _read(0, chunk, (unsigned) sizeof chunk);
-#else
-                    const ssize_t n = ::read(0, chunk, sizeof chunk);
-                    if (n < 0 && errno == EINTR) continue;
-#endif
-                    if (n <= 0) {
-                        if (buf.empty()) return false;
-                        out.swap(buf);
-                        buf.clear();
-                        return true;
-                    }
-                    buf.append(chunk, (size_t) n);
-                }
-            };
-            while (getline_fd(l)) {
-                strata::platform::idle_poke();   // (the service threads asleep after a long quiet wake for this line)
-                if (!l.empty() && l.back() == '\r') l.pop_back();
-                std::lock_guard<std::mutex> lk(mu);
-                if (l == "STOP" || l.rfind("STOP ", 0) == 0) {
-                    stop.store(true);
-                    if (l == "STOP") stop_all.store(true);
-                    else stop_rids.push_back(std::atoll(l.c_str() + 5));
-                    cv.notify_all();
-                    continue;
-                }
-                if (l == "QUIT") stop.store(true), stop_all.store(true);
-                q.push_back(l);
-                cv.notify_all();
-            }
-            std::lock_guard<std::mutex> lk(mu);
-            eof = true;
-            stop.store(true);
-            stop_all.store(true);
-            cv.notify_all();
-        }).detach();
-    }
-    bool next(std::string& l) {
-        std::unique_lock<std::mutex> lk(mu);
-        cv.wait(lk, [&] { return !q.empty() || eof; });
-        if (q.empty()) return false;
-        l = q.front();
-        q.pop_front();
-        return true;
-    }
-};
 
 // DS4_PROF: the GPU's time a decoded token by stage between two snapshots - the CLI's run, or a serve request's
 // decode (one line a request whose decode was profiled, so a caller can count them)
@@ -731,9 +654,25 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::printf("READY %lld stop\n", (long long) m.max_context());
     std::fflush(stdout);
     start_watchdog(m);
-    std::fprintf(stderr, "maya ds4 serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <pictures> <ids>; STOP, QUIT\n");
-    Lines in;
+    std::fprintf(stderr, "maya ds4 serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <pictures> <ids>; STOP, QUIT; "
+                         "LEND, RETURN, LENDABLE\n");
+    strata::ds4::Lines in;
     in.start();
+    // the lend commands (LEND, RETURN, LENDABLE, core::LendCommands): one handler and its leases for the life of the
+    // engine, run on this thread only, between the model's calls - idle, between a prompt's windows and between a
+    // request's decode rounds.  Never while a feed() runs (a run of chunks holds the cards' tails): a command that comes
+    // during one waits for it to return.  Every stdout line is this thread's, so an answer never lands inside another
+    const std::unique_ptr<strata::core::VramLender> lender = m.lender();
+    strata::core::LendCommands lends(*lender);
+    const auto lend_reply = [&](const std::string& l) {
+        std::string reply;
+        lends.handle(l, reply);
+        std::fputs(reply.c_str(), stdout);
+        std::fflush(stdout);
+    };
+    const auto serve_lends = [&] {
+        for (std::string l; in.take_lend(l);) lend_reply(l);
+    };
     std::string line;
     unsigned long long counter = 0;
     long long log_req = 0;   // (DS4_ROUND_LOG's tags)
@@ -1612,6 +1551,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::string err;
         bool ok = true, stopped = false;
         while (ok && P.done < total) {
+            serve_lends();   // (before the first window too: commands that came while the slots or pictures were read)
             if (stop_now()) {
                 stopped = true;
                 break;
@@ -1751,11 +1691,16 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     while (!multi) {   // one conversation: a request at a time
         g_busy.store(false);   // (waiting for a request: no watchdog)
         if (!in.next(line) || line == "QUIT") break;
+        if (strata::ds4::lend_line(line)) {   // (idle: answered at once)
+            lend_reply(line);
+            continue;
+        }
         beat();
         g_busy.store(true);
         const bool geni = line.rfind("GENI ", 0) == 0;
         if (!geni && line.rfind("GEN ", 0) != 0) {
-            std::printf("ERR unsupported command '%s' (GEN, GENI, STOP and QUIT)\n", line.substr(0, line.find(' ')).c_str());
+            std::printf("ERR unsupported command '%s' (GEN, GENI, STOP, QUIT, LEND, RETURN and LENDABLE)\n",
+                        line.substr(0, line.find(' ')).c_str());
             std::fflush(stdout);
             continue;
         }
@@ -1814,6 +1759,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         //  past the budget, and the round at it is a plain step whose next token, not fed yet, becomes think_end)
         bool in_think = r.think_budget > 0 && r.think_end >= 0;
         for (;;) {
+            serve_lends();   // (between two rounds: after a step, or after a verify and before the next draft)
             if (in.stop.load()) {
                 finish = "cancel";
                 break;
