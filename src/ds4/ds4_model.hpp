@@ -89,6 +89,21 @@ void slots_back(std::vector<int>& out, std::vector<int>& free, int first, int co
 /// A region keeps kKeep live slots, so a lend of candidates leaves it at least one.
 int spare_slot(const std::vector<int>& slot, const std::vector<float>& heat, const std::vector<char>& ok, int& expert);
 
+/// A layer's RAM copies (the CPU lane's experts copied into RAM, --mmap-experts off or auto) as the cache's moves
+/// change them: `ram` (expert -> its copy's slot, -1: none), the `free` slots (at load the swaps' spare), `held` the
+/// copies held (every layer's).  Every slot is a copy's, free or taken by a move under way, so none is lost: a fill
+/// after a lend's return frees its expert's slot, and a slot beyond the swaps' spare takes a copy from the file.
+/// copy_take: the slot a move copies an expert into (the one a swap moves out of VRAM, or copy_want's), off the list
+/// (-1: none free - out to the file).
+int copy_take(std::vector<int>& free);
+/// copy_land: a move switched in - `in` into VRAM (-1: none; its copy's slot freed), `out` (-1: none, a fill) into
+/// copy_take's slot `took` (-1: none) when `got` (the copy made; else the slot back on the list).
+void copy_land(std::vector<int>& ram, std::vector<int>& free, int& held, int in, int out, int took, bool got);
+/// copy_want: the expert read from the file into a free slot - the hottest in neither VRAM (`slot`) nor RAM - when
+/// more than the swaps' spare is free (-1: none).
+int copy_want(const std::vector<int>& slot, const std::vector<int>& ram, const std::vector<float>& heat,
+              const std::vector<int>& free);
+
 /// What the lender needs of the engine, from the thread that runs the windows and between them.
 class Site {
 public:
