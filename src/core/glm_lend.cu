@@ -27,7 +27,8 @@
 // 512 MiB), the rest to disk.  The decode is stopped for the lend, and a D2H copy of 8 GiB of experts over a PCIe 4.0
 // x4 link took 1.9 s of it; dropped experts cost nothing now and are read from disk when a route wants them.
 //
-// Which blocks.  lend_choose, one block at a time: the one whose leaving costs least a slot.  A layer that loses c
+// Which blocks.  lend_choose, one block at a time: a block of one layer before a block two layers share (so how many
+// can go does not follow the heat), and of those the one whose leaving costs least a slot.  A layer that loses c
 // slots loses its c coldest experts (a lent slot's expert moves into an empty slot of its layer or over a colder
 // resident), so the cost is the layer's c coldest slots' worth (an empty slot 0, a resident 1 + its aged LFU count).
 // Equal worth - a fresh start, or cold layers - spreads the lend over the layers and takes a region's end first.
@@ -94,10 +95,12 @@ std::vector<int> lend_choose(const std::vector<LendBlock>& cand, const std::vect
             if (!ok) continue;
             const double per = n > 0 ? (double) w / n : 0.0;
             const int ns = (int) cand[i].spans.size();
+            // (the span count first: a shared block taken early, its few slots the cheapest, can leave a layer short
+            //  of a whole block of its own - how many blocks can go would then follow the heat)
             const bool better =
-                best < 0 || per < b_per ||
-                (per == b_per && (ns < b_spans ||
-                                  (ns == b_spans && (room > b_room ||
+                best < 0 || ns < b_spans ||
+                (ns == b_spans && (per < b_per ||
+                                   (per == b_per && (room > b_room ||
                                                      (room == b_room && cand[i].block > cand[(size_t) best].block)))));
             if (better) {
                 best = (int) i;
