@@ -25,9 +25,15 @@
 //
 // Lease ids are opaque to the caller (decimal numbers today, never 0) and unique for the life of the process, also
 // across several LendCommands.  Maya does not record who borrows: a lease is an id, a card and a size.
+//
+// The commands come while requests run.  An engine's stdin reader thread passes each line through a LendQueue, and the
+// engine's command loop takes them on its own thread: LENDABLE at any line, LEND and RETURN where nothing is in flight.
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -84,6 +90,34 @@ struct LendCardStatus {
     std::size_t lendable_mib = 0;
     std::size_t lent_mib = 0;
     std::size_t block_mib = 0;
+};
+
+/// What a control line is to the lend commands, by its first word (split on blanks as LendCommands::handle splits it):
+/// not a lend command, LENDABLE (it only reads the engine's figures: answered at any line, also between two tokens of
+/// a request), or LEND / RETURN (they change the cache: answered only where nothing is in flight on any card).  A
+/// malformed lend command is still one of them: LendCommands answers it.
+enum class LendLineKind { none, lendable, change };
+LendLineKind lend_line_kind(const std::string& line);
+
+/// The lend command lines waiting for an engine's command loop.  The stdin reader thread routes every line through
+/// route(), which keeps the lend commands and leaves the rest to the engine's own queue; the command loop takes them in
+/// the order they came.  waiting() is a lock-free look for the loop's hot paths (the decode polls it every token).
+class LendQueue {
+public:
+    /// The reader: a lend command is queued (true); any other line is not (false), for the engine's own commands.
+    bool route(const std::string& line);
+    /// A lend command waits.
+    bool waiting() const { return n_.load(std::memory_order_acquire) > 0; }
+    /// The command loop: the next lend command, of either kind (false: none waits).
+    bool take(std::string& line);
+    /// The next one only while it is a LENDABLE: a LEND or RETURN in front keeps it, and those after it, in the queue
+    /// (the answers go out in the order the commands came).
+    bool take_lendable(std::string& line);
+
+private:
+    std::mutex mu_;
+    std::deque<std::string> q_;
+    std::atomic<std::size_t> n_{0};
 };
 
 /// The lend commands over one engine: holds the open leases and turns a control line into its answer.  Keep one for
