@@ -38,28 +38,34 @@ std::vector<int> candidates(const std::vector<Block>& blocks, int n_regions, int
         if (b.foreign || fixed) count(b);   // (never lent: what it holds stays)
         else open[i] = 1;
     }
-    // a region short of its floor keeps its hottest open blocks (by its own slots' heat) until it has it
+    // a region short of its floor keeps open blocks of its live slots until it has it: the one that holds live slots
+    // of the most regions still short (one block keeps several floors), then the most of its own, then the lowest
+    // index.  The layout and the blocks lent decide, never the heat or which slots hold an expert: the same blocks stay
+    // whatever the cache holds, and a lend (of candidates only) leaves the choice for the rest as it was
     for (int r = 0; r < n_regions; ++r) {
-        if (have[(size_t) r] >= keep) continue;
-        std::vector<std::pair<float, int>> mine;   // (its heat in the block, block)
-        for (size_t i = 0; i < nb; ++i) {
-            if (!open[i]) continue;
-            float h = 0.0f;
-            bool in = false;
-            for (const Slot& s : blocks[i].slots)
-                if (s.region == r && s.live) {
-                    in = true;
-                    h += s.heat;
+        while (have[(size_t) r] < keep) {
+            int best = -1, b_short = 0, b_own = 0;
+            for (size_t i = 0; i < nb; ++i) {
+                if (!open[i]) continue;
+                int own = 0;
+                std::vector<int> shorts;   // the regions still short it holds live slots of
+                for (const Slot& s : blocks[i].slots) {
+                    if (!s.live || s.fixed || s.region < 0 || s.region >= n_regions) continue;
+                    own += s.region == r;
+                    if (have[(size_t) s.region] < keep &&
+                        std::find(shorts.begin(), shorts.end(), s.region) == shorts.end())
+                        shorts.push_back(s.region);
                 }
-            if (in) mine.push_back({h, (int) i});
-        }
-        std::stable_sort(mine.begin(), mine.end(), [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
-            return a.first > b.first;
-        });
-        for (const auto& m : mine) {
-            if (have[(size_t) r] >= keep) break;
-            open[(size_t) m.second] = 0;
-            count(blocks[(size_t) m.second]);
+                const int ns = (int) shorts.size();
+                if (own > 0 && (best < 0 || ns > b_short || (ns == b_short && own > b_own))) {
+                    best = (int) i;
+                    b_short = ns;
+                    b_own = own;
+                }
+            }
+            if (best < 0) break;   // (none left: it keeps what it has)
+            open[(size_t) best] = 0;
+            count(blocks[(size_t) best]);
         }
     }
     std::vector<int> out;

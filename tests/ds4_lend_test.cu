@@ -1,14 +1,18 @@
 // tests/ds4_lend_test.cu - DeepSeek's lend of its expert pool (src/ds4/ds4_lend.cu), no model:
 //  - the block choice over made-up blocks: the fixed slots' blocks (swap spare, recent slots), foreign and lent
-//    blocks are never candidates, a region short of its floor keeps its hottest blocks, the lendable rule's figures,
-//    the pick spread evenly over the regions and coldest first;
+//    blocks are never candidates, a region short of its floor keeps the blocks that keep the most floors (then the
+//    most of its slots, the lowest index), the lendable rule's figures, the pick spread evenly over the regions and
+//    coldest first;
+//  - lendable the layout's: the same for full, half empty and differently hot layers, and after a lend of all of it,
+//    its return (the slots empty) and the cache's fill;
 //  - the slot-table changes: slots out (their experts dropped, off the free list), back (on it when no card lends
 //    them any more);
 //  - the lender over a real VMM pool on one card (needs a GPU with ~2 GiB free; STRATA_TEST_DEV picks it) and a
 //    made-up cache of four layers (one that cannot lend): a lend frees at least its MiB to the driver, no lent slot is
 //    left in a slot table, the spare, the recent slots and the floor stay, the other slots keep their data; more than
 //    lendable is refused with the max; a return while another allocation holds the memory is busy and keeps the lease;
-//    a return maps the blocks back, their slots come back empty and a fill writes them; the plain fallback lends 0.
+//    a return maps the blocks back, their slots come back empty and a fill writes them; the plain fallback lends 0;
+//    the steady layout in a pool of its own: lend the whole lendable, return, fill - lendable as before, lent again.
 #include "ds4_model.hpp"
 #include "strata/core/vram_pool.hpp"
 
@@ -72,10 +76,11 @@ void test_choice() {
     // region 0 keeps its floor in block 1 (the spare's, not lendable), region 1 in block 7 (foreign: never lent) and
     // block 9 (region 3's floor), region 3 in block 9: blocks 0, 2, 3, 4, 5 and 6 may go
     CHECK(c == std::vector<int>({0, 2, 3, 4, 5, 6}), "candidates (keep 1): %zu of them", c.size());
-    // a floor of 3: region 0 has 1 in block 1, keeps its hottest (3: 2 more); region 1 has 2 (blocks 7 and 9) and
-    // keeps its hottest (5: 2 more); region 3 has 1 and nothing else to keep
+    // a floor of 3: region 0 has 1 in block 1 and keeps 0 (its lowest of three alike: 2 more, whatever their heat);
+    // region 1 has 1 in block 7, keeps 9 (region 3's too) and then 4 (two of its own, the lowest); region 3 has 1 and
+    // nothing else to keep
     const std::vector<int> c3 = lend::candidates(B, 4, 3);
-    CHECK(c3 == std::vector<int>({0, 2, 4, 6}), "candidates (keep 3): %zu of them", c3.size());
+    CHECK(c3 == std::vector<int>({2, 3, 5, 6}), "candidates (keep 3): %zu of them", c3.size());
     for (int b : c) CHECK(b != 1 && b != 7 && b != 8 && b != 9, "block %d is a candidate", b);
 
     const lend::Figures f = lend::figures(B, c.size(), 32 * kMiB);
@@ -94,6 +99,55 @@ void test_choice() {
     CHECK(lend::pick(B, c, 99).size() == c.size(), "pick more than there are");
     std::printf("choice: candidates %zu (keep 1), %zu (keep 3); lendable %zu MiB of a pool of %zu\n", c.size(),
                 c3.size(), f.lendable / kMiB, f.pool / kMiB);
+}
+
+// two layers of 5 slots side by side, 2 a block (the pool's layout): region 0's spare and recent slot in block 0,
+// slots 2-3 in block 1, slot 4 in block 2 with region 1's slot 0; region 1's slots 1-2 in block 3, its recent slot
+// and spare in block 4.  h0, h1: each slot's expert's heat (0: empty)
+std::vector<lend::Block> steady_blocks(const std::vector<float>& h0, const std::vector<float>& h1) {
+    std::vector<lend::Block> B;
+    B.push_back(blk({{0, true, true, h0[0]}, {0, true, true, h0[1]}}));
+    B.push_back(blk({{0, false, true, h0[2]}, {0, false, true, h0[3]}}));
+    B.push_back(blk({{0, false, true, h0[4]}, {1, false, true, h1[0]}}));
+    B.push_back(blk({{1, false, true, h1[1]}, {1, false, true, h1[2]}}));
+    B.push_back(blk({{1, true, true, h1[3]}, {1, true, true, h1[4]}}));
+    return B;
+}
+
+void test_steady() {
+    // both regions are short of their floor outside the fixed blocks; block 2 keeps both floors, so blocks 1 and 3
+    // may go - whatever the heat, whichever slots hold an expert
+    const std::vector<std::vector<float>> h0s = {{1, 1, 9, 9, 1}, {1, 1, 1, 1, 9}, {0, 0, 0, 0, 3}, {0, 0, 4, 0, 0},
+                                                 {0, 0, 0, 0, 0}},
+                                          h1s = {{2, 2, 2, 2, 2}, {0, 9, 9, 0, 0}, {5, 0, 0, 0, 0}, {0, 0, 0, 0, 0},
+                                                 {0, 0, 0, 0, 0}};
+    for (size_t i = 0; i < h0s.size(); ++i)
+        for (size_t j = 0; j < h1s.size(); ++j) {
+            const std::vector<lend::Block> B = steady_blocks(h0s[i], h1s[j]);
+            const std::vector<int> c = lend::candidates(B, 2, 1);
+            CHECK(c == std::vector<int>({1, 3}), "heat case %zu/%zu: %zu candidates", i, j, c.size());
+        }
+
+    // a lend of all of it, its return (the slots empty) and the cache's fill of them (the hottest experts)
+    std::vector<lend::Block> B = steady_blocks({1, 1, 1, 1, 9}, {2, 2, 2, 2, 2});
+    const std::vector<int> c0 = lend::candidates(B, 2, 1);
+    const size_t l0 = lend::figures(B, c0.size(), 32 * kMiB).lendable;
+    const std::vector<int> p = lend::pick(B, c0, (int) (l0 / (32 * kMiB)));
+    CHECK(p.size() * 32 * kMiB == l0, "a pick of the lendable %zu MiB took %zu blocks", l0 / kMiB, p.size());
+    for (int b : p) B[(size_t) b].mapped = false;
+    CHECK(lend::candidates(B, 2, 1).empty(), "candidates with it all lent");
+    for (int b : p) {
+        B[(size_t) b].mapped = true;
+        for (lend::Slot& s : B[(size_t) b].slots) s.heat = 0.0f;
+    }
+    const size_t l1 = lend::figures(B, lend::candidates(B, 2, 1).size(), 32 * kMiB).lendable;
+    CHECK(l1 == l0, "lendable after the return %zu MiB, before %zu", l1 / kMiB, l0 / kMiB);
+    for (int b : p)
+        for (lend::Slot& s : B[(size_t) b].slots) s.heat = 20.0f;
+    const size_t l2 = lend::figures(B, lend::candidates(B, 2, 1).size(), 32 * kMiB).lendable;
+    CHECK(l2 == l0, "lendable after the fill %zu MiB, before %zu", l2 / kMiB, l0 / kMiB);
+    std::printf("steady: lendable %zu MiB for any heat; %zu after a return, %zu after the fill\n", l0 / kMiB, l1 / kMiB,
+                l2 / kMiB);
 }
 
 void test_slots() {
@@ -415,6 +469,61 @@ void test_lender(int dev) {
     CHECK(!lender.lend(dev + 100, block_mib).ok, "a lend on a card with no pool");
 }
 
+// the steady layout (steady_blocks) in a real pool: blocks of 16 MiB, slots of 8 MiB.  Region 0 holds its hottest
+// expert in slot 4 (block 2), and one hotter than all waits outside VRAM; the lend of the whole lendable, its return
+// and the fill (that expert into block 1) leave lendable where it was
+void test_steady_lender(int dev) {
+    VramPool P;
+    std::string err;
+    auto own = std::make_unique<FakeSite>();
+    own->dev = dev;
+    own->L.resize(2);
+    for (int r = 0; r < 2; ++r) {
+        FakeLayer& l = own->L[(size_t) r];
+        l.n = 5;
+        l.n_exp = 8;
+        l.spare = r == 0 ? 0 : 4;
+        l.rc_base = r == 0 ? 1 : 3;
+        l.rc_n = 1;
+        l.slot.assign(8, -1);
+        l.heat.assign(8, 0.0f);
+        l.out.assign(5, 0);
+        for (int e = 0; e < 4; ++e) l.slot[(size_t) e] = r == 0 ? e + 1 : e;   // (region 0's spare empty, 1's slot 4)
+    }
+    own->L[0].heat = {0.5f, 1.0f, 1.0f, 9.0f, 20.0f, 0.0f, 0.0f, 0.0f};
+    own->L[1].heat = {2.0f, 2.0f, 2.0f, 2.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    VramPool::Options o;
+    o.lend = true;
+    o.block_bytes = 16 * kMiB;
+    o.tag = "ds4 lend test (steady)";
+    if (!P.create(dev, {{8 * kMiB, 5}, {8 * kMiB, 5}}, o, err)) {
+        CHECK(false, "steady pool: %s", err.c_str());
+        return;
+    }
+    if (!P.lendable()) return;
+    CHECK(P.block_count() == 5 && P.block_bytes() == 16 * kMiB, "steady pool: %d blocks of %zu MiB", P.block_count(),
+          P.block_bytes() / kMiB);
+    own->P = &P;
+    FakeSite* S = own.get();
+    lend::Lender lender(std::move(own));
+    const size_t l0 = lender.lend_cards()[0].lendable_mib;
+    CHECK(l0 == 32, "steady lendable %zu MiB, want 2 blocks", l0);
+    const strata::core::LendResult a = lender.lend(dev, l0);
+    CHECK(a.ok && a.mib == l0, "lend the lendable %zu: ok %d mib %zu", l0, (int) a.ok, a.mib);
+    S->check_tables("steady: after the lend");
+    CHECK(lender.give_back(dev, a.token) == strata::core::GiveBack::returned, "steady: the return");
+    const size_t l1 = lender.lend_cards()[0].lendable_mib;
+    CHECK(l1 == l0, "steady: lendable after the return %zu, before %zu", l1, l0);
+    S->fill_all();
+    cudaDeviceSynchronize();
+    const size_t l2 = lender.lend_cards()[0].lendable_mib;
+    CHECK(l2 == l0, "steady: lendable after the fill %zu, before %zu", l2, l0);
+    const strata::core::LendResult b = lender.lend(dev, l2);
+    CHECK(b.ok && b.mib == l2, "steady: lend the lendable again %zu: ok %d mib %zu", l2, (int) b.ok, b.mib);
+    if (b.ok) CHECK(lender.give_back(dev, b.token) == strata::core::GiveBack::returned, "steady: the second return");
+    std::printf("steady lender: lendable %zu MiB, %zu after the return, %zu after the fill\n", l0, l1, l2);
+}
+
 void test_fallback(int dev) {
     VramPool P;
     std::string err;
@@ -433,6 +542,7 @@ void test_fallback(int dev) {
 
 int main() {
     test_choice();
+    test_steady();
     test_slots();
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
@@ -448,6 +558,7 @@ int main() {
         std::printf("ds4_lend_test: CUDA%d, %zu MiB free\n", dev, free_bytes() / kMiB);
         test_fallback(dev);
         test_lender(dev);
+        test_steady_lender(dev);
     }
     if (g_fail == 0) std::printf("ds4_lend_test: ok\n");
     return g_fail == 0 ? 0 : 1;
