@@ -416,11 +416,11 @@ class OnDemandVision(OnDemandVisionBase):
         self.assertIsNotNone(during, "no lease while the encoder ran")
         lease = during["leases"][0]
         self.assertEqual(len(during["leases"]), 1)
-        self.assertEqual((lease["card"], lease["mib"]), ("0000:01:00.0", 1024))   # the engine's dev 0
-        self.assertEqual(next(c for c in during["cards"] if c["card"] == "0000:01:00.0")["lent"], 1024)
+        self.assertEqual((lease["gpu"], lease["mib"]), ("0000:01:00.0", 1024))   # the engine's dev 0
+        self.assertEqual(next(c for c in during["gpus"] if c["gpu"] == "0000:01:00.0")["lent"], 1024)
         after = self.state()
         self.assertEqual(after["leases"], [])
-        self.assertTrue(all(c["lent"] == 0 for c in after["cards"]), after)
+        self.assertTrue(all(c["lent"] == 0 for c in after["gpus"]), after)
         self.assertIsNone(self.vision.proc)                # the encoder ended with the request's pictures
         self.assertFalse(self.vision.owed)
         lines = self.engine_lines()
@@ -472,14 +472,14 @@ class OnDemandVisionRestart(OnDemandVisionBase):
         self.vision.lease = self.vision.lend()            # (an encode whose return kept failing: the lease is owed)
         self.assertTrue(self.vision.owed)
         self.engine.restart()
-        code, other = self.svc.vram_lend.lend(self.engine, {"card": "0000:01:00.0", "mib": 64})
+        code, other = self.svc.vram_lend.lend(self.engine, {"gpu": "0000:01:00.0", "mib": 64})
         self.assertEqual(code, 200, other)
         self.assertTrue(self.vision.settle())
         self.assertFalse(self.vision.owed)
         self.assertEqual([x for x in self.engine_lines() if x.startswith("RETURN ")], [])
         st = self.state()
         self.assertEqual(st["leases"], [other])
-        self.assertEqual(next(c for c in st["cards"] if c["card"] == "0000:01:00.0")["lent"], 64)
+        self.assertEqual(next(c for c in st["gpus"] if c["gpu"] == "0000:01:00.0")["lent"], 64)
         self.go.write_text("go")                          # the next picture borrows and gives back its own lease
         self.prepare()
         self.assertEqual(self.state()["leases"], [other])

@@ -1871,8 +1871,8 @@ class Vision:
             self.proc.kill()
 
 
-def first_card(engine) -> str | None:
-    """The PCI address of the engine's first GPU (its VRAM line dev=0, as the /vram routes name it): the card the
+def first_gpu(engine) -> str | None:
+    """The PCI address of the engine's first GPU (its VRAM line dev=0, as the /vram routes name it): the GPU the
     on-demand encoder runs on - main() gives the encoder the first of the config's GPUs, which is the engine's CUDA
     device 0 (CUDA_VISIBLE_DEVICES lists the config's GPUs in its order).  None for an engine without VRAM lines."""
     return next((r.get("addr") for r in getattr(engine, "vram", None) or [] if r.get("dev") == 0 and r.get("addr")),
@@ -1882,17 +1882,17 @@ def first_card(engine) -> str | None:
 def wire_vision_lease(vision: Vision, svc, mib: int):
     """The on-demand encoder borrows `mib` MiB on the engine's first GPU through the service's /vram leases (so
     /vram/state lists it while the encoder runs) and gives the lease back when it ends.  A lend the engine refuses
-    (the card cannot lend that much now, or the engine cannot lend or did not answer) does not start the encoder: the
-    picture request fails with the reason - an encoder started without the memory could run the card out of it in the
+    (the GPU cannot lend that much now, or the engine cannot lend or did not answer) does not start the encoder: the
+    picture request fails with the reason - an encoder started without the memory could run the GPU out of it in the
     middle of the model's own work.  A return the engine answers "still in use" (409 retry) is tried again: Vision's
     _stop for a few seconds, then settle() before the next request; 503 (no answer) likewise.  A lease the engine no
     longer has (404: it ended or restarted) is back."""
     def lend() -> str:
-        card = first_card(svc.engine)
-        if card is None:
+        gpu = first_gpu(svc.engine)
+        if gpu is None:
             raise ValueError("the model does not report its GPUs, so it cannot lend the vision encoder its memory: the "
                              "picture cannot be read")
-        code, out = svc.vram_lend.lend(svc.engine, {"card": card, "mib": mib})
+        code, out = svc.vram_lend.lend(svc.engine, {"gpu": gpu, "mib": mib})
         if code == 200:
             return out["id"]
         if code == 409:
@@ -6069,13 +6069,13 @@ def main() -> int:
                   flush=True)
         if on_demand:
             # what the first GPU can lend now, with nothing lent yet (LENDABLE; 0 for an engine without lending)
-            card = first_card(engine)
+            gpu = first_gpu(engine)
             _, lendable = vram_lend.Lender().state(engine)
-            room = next((c["lendable"] for c in lendable["cards"] if c["card"] == card), 0) if card else 0
+            room = next((g["lendable"] for g in lendable["gpus"] if g["gpu"] == gpu), 0) if gpu else 0
             if room >= vision_mib:
                 vision = on_demand_vision = Vision(vcfg, log=vlog, env=venv, start=False)   # (wired below, with svc)
                 print(f"[maya] images: the vision encoder starts when a picture arrives, in {vision_mib} MiB the "
-                      f"model lends it on GPU {card} ({room} MiB lendable there now)", flush=True)
+                      f"model lends it on GPU {gpu} ({room} MiB lendable there now)", flush=True)
             else:   # the model's GPU memory is too small to lend that much (or an engine without lending)
                 print("[maya] images: the model cannot lend the vision encoder its GPU memory here - the encoder "
                       "runs on the CPU", flush=True)
