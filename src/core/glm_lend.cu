@@ -7,12 +7,12 @@
 // synchronized and the blocks go back to the driver (lend_unmap).  A return maps them again at the same addresses and
 // the slots are free (lend_free): the boundaries hand them out as spares and refill them with background promotions as
 // the routes ask (fast_boundary steps 3 and 5).  The pool's tail - the prompt path's buffers while a prompt runs, its
-// own allocation - is never lent here: it stays what the prompt path and the vision encoder borrow (lend_tail), and
-// those touch only slots [n_main, n), this only [0, n_main).
+// own allocation - is never lent here: it stays what the prompt path borrows (lend_tail), and that touches only slots
+// [n_main, n), this only [0, n_main).
 //
 // The lendable rule (strata::core::lendable_bytes) on a part:
 //   pool    = its main-slot blocks still mapped + the tail (FastState::xpool_bytes, fast_setup's k_extra slots a layer)
-//   borrow  = the tail: what the prompt path borrows for its buffers (prefill_lend; the vision encoder the same)
+//   borrow  = the tail: what the prompt path borrows for its buffers (prefill_lend)
 //   minimum = Glm5Model::pool_keep(n_exp_used) slots a layer - one route's experts, the device's spares and 2, the
 //             floor the prompt path's lending already keeps (and route + spares the pool's own sizing needs) - in the
 //             pool bytes they take (a slot's share of its block, block / per_block)

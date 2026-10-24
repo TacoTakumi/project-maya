@@ -1251,7 +1251,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             return (int) ((bytes + stride_sum - 1) / std::max<size_t>(1, stride_sum));
         };
         // A COMPLETE pool where the budget holds one: every expert and the spares in each layer's main slots, the tail
-        // the prompt path (and the vision encoder) borrows BEYOND them.  The cap of n_expert slots a layer, with the
+        // the prompt path borrows BEYOND them.  The cap of n_expert slots a layer, with the
         // tail carved out of it, left a pool that could hold everything short: Windows sizes the 8065S's 160 GB
         // carve-out like a discrete card (unified_memory is Linux's), so Maya-S's 288 slots kept 3 spares and lent
         // ~20 a layer to every long prompt - the warm-up held 285 of 288 experts (the rest from the SSD, 0.1-0.5 disk
@@ -1262,9 +1262,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         // else used); Linux's unified-memory budget is the experts' bytes exactly, so it keeps its own policy there.
         // STRATA_GLM_COMPLETE_POOL=0: the capped pool (A/B); on by default on every GPU (complete_pool_on, #474).
         {
-            int k_full = pf_ != nullptr ? tail_slots(prefill_borrow_bytes()) : 0;
-            if (const char* v = getenv("STRATA_GLM_VISION_LEND_MB"); v != nullptr && dev_ == 0)
-                k_full = std::max(k_full, tail_slots((size_t) std::max(0LL, std::atoll(v)) << 20));
+            const int k_full = pf_ != nullptr ? tail_slots(prefill_borrow_bytes()) : 0;
             const int full = glmfast::complete_pool_on() && !F->unified_memory
                                  ? glmfast::complete_pool_slots(avail, stride_sum, g.n_expert, gf::kSpares, k_full)
                                  : 0;
@@ -1279,26 +1277,13 @@ bool Glm5Model::fast_setup(std::string& err) {
             const int k_keep = pool_keep(g.n_exp_used);
             const int k_max = per - k_keep;
             if (k_extra > k_max && k_max > 0) k_extra = tail_slots(prefill_trim_prestage((size_t) k_max * stride_sum));
-            // (a prompt runs alone - no decode beside it, unlike the vision encoder's lending below - so its main
-            // slots need little more than one route's experts and the spares)
+            // (a prompt runs alone - no decode beside it - so its main slots need little more than one route's
+            // experts and the spares)
             if (per - k_extra < k_keep) {
                 std::fprintf(stderr, "glm prefill: CUDA%d the pool (%d slots/layer) cannot lend %zu MB - token by token\n",
                              dev_, per, prefill_borrow_bytes() >> 20);
                 prefill_destroy();
                 k_extra = 0;
-            }
-        }
-        // an on-demand vision encoder on the first GPU (the server sets STRATA_GLM_VISION_LEND_MB) borrows the same
-        // tail while it encodes, so the tail there is the larger of the two needs
-        vis_lend_ok_ = false;
-        if (const char* v = getenv("STRATA_GLM_VISION_LEND_MB"); v != nullptr && dev_ == 0) {
-            const size_t vb = (size_t) std::max(0LL, std::atoll(v)) << 20;
-            if (vb > 0 && per - tail_slots(vb) >= g.n_exp_used + gf::kSpares + 8) {
-                k_extra = std::max(k_extra, tail_slots(vb));
-                vis_lend_ok_ = true;
-            } else if (vb > 0) {
-                std::fprintf(stderr, "glm fast: CUDA%d the pool (%d slots/layer) cannot lend %zu MB to the vision "
-                                     "encoder\n", dev_, per, vb >> 20);
             }
         }
         // the expert profile (--expert-profile, Strata's profile.bin): read once per half, before the split below
@@ -1495,9 +1480,6 @@ bool Glm5Model::fast_setup(std::string& err) {
             b += (size_t) k_extra * P.stride;
         }
         if (pf_ != nullptr && !prefill_bind(xregion, xtot, err)) return false;
-        if (vis_lend_ok_)
-            std::fprintf(stderr, "glm fast: CUDA%d the vision encoder borrows the pool's tail (%.2f GB) while it "
-                                 "encodes\n", dev_, (double) xtot / 1073741824.0);
         F->cnt.assign((size_t) NL * g.n_expert, 0);
         F->usage.assign((size_t) NL * g.n_expert, 0);
         F->pred_of.assign((size_t) NL, std::array<int, 8>{-1, -1, -1, -1, -1, -1, -1, -1});
@@ -4306,7 +4288,6 @@ std::vector<Glm5Model::VramReport> Glm5Model::vram_report() const {
             r.slots = F->pool_slots;
         }
         r.borrow = m->prefill_borrow_bytes();
-        r.vision = m->vision_lend_bytes();
         r.ctx = m->max_ctx_;
         r.l0 = m->l0_;
         r.l1 = m->l1_;

@@ -519,8 +519,7 @@ struct Glm5Model::FastState {
     // holding per_block slots each, back to back from the block's start, slot 0 at position first_pos of the block at
     // origin.  So they are origin + i * stride only within a block (run_end); slot_ptr / slot_index go by the blocks.
     // [n_main, n) are at xbase: every layer's tail lies in ONE region (xpool), which the prompt path borrows for its
-    // buffers while a prompt runs (those slots are kLent then) - and an on-demand vision encoder while it encodes (the
-    // region is freed; xbase is null until it comes back).
+    // buffers while a prompt runs (those slots are kLent then).
     struct LayerPool {
         uint8_t* origin = nullptr;
         uint8_t* xbase = nullptr;
@@ -607,8 +606,8 @@ struct Glm5Model::FastState {
     std::vector<int> pool_layer;
     size_t pool_bytes = 0;   // the pool's and the tail's bytes
     int64_t pool_slots = 0;
-    // the lendable tail (every layer's slots [n_main, n)) is its own allocation: an on-demand vision encoder can
-    // have that memory while it runs (vision_lend frees it, vision_reclaim allocates it again)
+    // the lendable tail (every layer's slots [n_main, n)) is its own allocation, outside the pool's blocks: what the
+    // prompt path borrows (lend_tail), never a block a lend unmaps
     uint8_t* xpool = nullptr;
     size_t xpool_bytes = 0;
     // how far the prompt's lending (lend_tail) freed xpool: the first tail slot it kept, so [xpool + the prompt's
