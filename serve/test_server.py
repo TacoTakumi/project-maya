@@ -2418,6 +2418,56 @@ for line in sys.stdin:
         self.assertLess(time.monotonic() - t0, 5.0)         # (a short wait for a DONE that does not come)
         self.assertEqual(self.run_gen(3), [66, 67])
 
+class StripThinkingFillers(unittest.TestCase):
+    """A run config's "strip_thinking_fillers": "hmm" leaves the earlier turns' thinking, and nothing else changes - the
+    prompt of one turn still starts the next one's, so the conversation cache holds."""
+
+    def test_strip_filler(self):
+        from serve.frontend import strip_filler
+        for text, want in (
+                ("rc files. Hmm. Options:\n  a) x", "rc files. Options:\n  a) x"),
+                ("the value. Hmm, but the type", "the value. But the type"),
+                ("a cheap guard. Hmm \u2014 hmm, actually, wait: hmm. Let me", "a cheap guard. Actually, wait: Let me"),
+                ("`clock` \u2014 hmm \u2014 not sure", "`clock` \u2014 not sure"),
+                ("done.\n\nHmm \u2014 hmm, hmm. Hmm. Wait, hmm. Hmm.", "done.\n\nWait"),
+                ("solvable: hmm.\n\nLet me look", "solvable\n\nLet me look"),
+                ("Hmm \u2014 hmm.", ""),
+                ("hmm.py and hmm_model and (hmm) stay", "hmm.py and hmm_model and (hmm) stay"),
+                ("Hmmm. ok", "Ok"),
+                ("no filler here", "no filler here")):
+            self.assertEqual(strip_filler(text), want, text)
+
+    def setUp(self):
+        tok = ByteTokenizer()
+        self.svc = Service(MockEngine(tok, ""), tok, ChatTemplate(ROOT / "serve/glm5_chat_template.jinja"))
+        self.turns = [{"role": "user", "content": "check it, hmm"}]
+        for k in range(3):
+            self.turns += [{"role": "assistant", "content": "", "reasoning_content": f"Step {k}. Hmm \u2014 hmm. next",
+                            "tool_calls": [{"function": {"name": "bash", "arguments": {"command": "ls"}}}]},
+                           {"role": "tool", "content": f"out {k}"}]
+
+    def prompt(self, messages):
+        return self.svc.tok.decode(self.svc.render_ids(messages, None, {}))
+
+    def test_off_by_default(self):
+        self.assertIn("Step 0. Hmm \u2014 hmm. next", self.prompt(self.turns))
+
+    def test_on(self):
+        self.svc.strip_fillers = True
+        p = self.prompt(self.turns)
+        self.assertIn("Step 0. Next", p)
+        self.assertNotIn("Hmm", p)
+        self.assertIn("check it, hmm", p)                # a user's text is left alone
+        self.assertIn("Step 0. Hmm", self.turns[1]["reasoning_content"])   # and so is the request
+
+    def test_cache_prefix_holds(self):
+        self.svc.strip_fillers = True
+        tail = "<|assistant|><think>"
+        for n in (3, 5):
+            before, after = self.prompt(self.turns[:n]), self.prompt(self.turns[:n + 2])
+            self.assertTrue(before.endswith(tail))
+            self.assertTrue(after.startswith(before[:-len(tail)]))
+
 
 class ThinkTok(ByteTokenizer):
     SPECIALS = ByteTokenizer.SPECIALS + ["<think>", "</think>"]

@@ -60,6 +60,7 @@ from serve.frontend import (CALL_END, CALL_START, MINIMAX_NS, ChatTemplate, Even
                             EFFORT_WORDS, QWEN_EFFORT, anthropic_to_messages, deepseek_effort_kwargs, deepseek_images,
                             effort_kwargs,
                             effort_level, effort_name, literal_tags, mark_literals, media_of, openai_to_messages,
+                            strip_thinking_fillers,
                             unmark_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.responses import (ResponseStore, input_items, input_page, normalize_request,  # noqa: E402
@@ -2144,6 +2145,8 @@ class Service:
         # the thinking budget (run config `thinking_budget`, tokens; 0 = none): a reasoning block that reaches it is
         # closed with the template's </think> and the answer follows - GLM at High can plan for 14k+ tokens
         self.think_budget = 0
+        # run config `strip_thinking_fillers`: "hmm" taken out of the earlier turns' thinking before it is rendered
+        self.strip_fillers = False
         # (MiniMax-M3.1 closes its reasoning with </mm:think>; its vocabulary may hold a plain "</think>" too)
         end = _special_ids("</mm:think>") if getattr(template, "minimax", False) else _special_ids("</think>")
         self.think_end_id = end[0] if end else None
@@ -2180,6 +2183,8 @@ class Service:
         """The template rendered for `messages` and `tools` (+ `suffix`, text the server appends to the prompt) and
         tokenized.  A special token's text inside a message or a tool is encoded as that text; only the literals the
         template (or the suffix) writes are special tokens."""
+        if self.strip_fillers:
+            messages = strip_thinking_fillers(messages)
         marked, marked_tools, changed = mark_literals(messages, tools, self.literals)
         prompt = self.template.render(marked, tools=marked_tools, **kwargs)
         if kwargs.get("enable_thinking") is False and prompt.endswith("<think>"):
@@ -6061,6 +6066,9 @@ def main() -> int:
     svc.loop_guard = loop_guard_setting(cfg)            # (MAYA_LOOP_GUARD=0 or "loop_guard": false: off)
     if not svc.loop_guard:
         print("[maya] loop guard: off (a request's \"loop_guard\": true turns it on for that request)", flush=True)
+    svc.strip_fillers = cfg.get("strip_thinking_fillers") is True
+    if svc.strip_fillers:
+        print("[maya] earlier turns' thinking: \"hmm\" taken out (strip_thinking_fillers)", flush=True)
     svc.api_key = a.api_key or cfg.get("api_key", "")
     try:
         svc.cors_origins = parse_cors_origins(cfg.get("cors_origins"))

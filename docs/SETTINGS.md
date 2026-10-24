@@ -409,6 +409,26 @@ same arguments and result: a note after it`, `maya:loop_guard_tool_repeats_total
 Off for the server: `MAYA_LOOP_GUARD=0`, or `"loop_guard": false` in the run config. A request can choose for itself
 with `"loop_guard": false` (or `true`) beside its sampling fields (Chat Completions, Anthropic Messages).
 
+## GLM: "Hmm" taken out of earlier thinking
+
+An agent client sends the model's earlier thinking back on every turn (`reasoning_content`, or Anthropic `thinking`
+blocks), and GLM-5.3's template keeps it in the prompt. GLM-5.3-Flash copies the style of that thinking: in a long
+agent session its "Hmm" grows turn by turn until a turn is nothing but "Hmm - hmm." (zai-org/GLM-5#146, #168). In the
+config, `maya-<model>.json`:
+
+```json
+"strip_thinking_fillers": true
+```
+
+Before the prompt is rendered, every "hmm" word in an earlier turn's thinking goes, with the punctuation after it;
+where it started a sentence or a line the next word gets its capital back, and where it ended a line the dash, comma
+or colon left in front of it goes too. Lines without a "hmm" stay as they were, and nothing else in the request
+changes. The same thinking always gives the same text, so the conversation cache still matches: only the newest turn's
+thinking is read again, as without it. A replay of a 188K-token agent turn that had broken this way (temperature 1.0,
+12 runs each): as sent, 4 runs fell into the loop (147 "Hmm" per 1000 tokens); filtered, none did (1.3 per 1000), and
+every run still thought before its tool call. A presence penalty did not help, and it hides the loop from the loop
+guard (the repeats are no longer word for word). Off when not set.
+
 ## Several requests at once
 
 This is a setting of **GLM-5.3-Flash**, **DeepSeek-V4.1-Flash** ([DeepSeek's below](#deepseek-v41-flash-several-requests-at-once))

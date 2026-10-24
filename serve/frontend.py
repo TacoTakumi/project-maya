@@ -429,6 +429,40 @@ def _late_system_to_user(messages: list[dict]) -> list[dict]:
     return [dict(m, role="user") if m.get("role") == "system" and i > 0 else m for i, m in enumerate(messages)]
 
 
+# one or more "hmm" words, each with the punctuation after it ("Hmm - hmm. Hmm, "), ending at a space or a line end
+# (so "hmm.py" and "hmm_x" stay)
+_FILLER_RUN = re.compile(r"(?:\b[Hh]mm+(?:[ \t]*[.,:;!?\u2014\u2013-]+)?(?=[ \t\n]|$)[ \t]*)+")
+
+
+def strip_filler(text: str) -> str:
+    """`text` without its "hmm" runs.  Where a run started a sentence or a line, the word after it gets its capital
+    back; where it ended a line, the space or the dash, comma or colon left in front of it goes too.  Every line
+    without a "hmm" stays as it was."""
+    out, pos = [], 0
+    for m in _FILLER_RUN.finditer(text):
+        before, pos = text[pos:m.start()], m.end()
+        if pos == len(text) or text[pos] == "\n":
+            out.append(re.sub(r"[ \t]*[,:;\u2014\u2013-]?[ \t]*$", "", before))
+            continue
+        out.append(before)
+        prev = before.rstrip(" \t")[-1:] or "\n"     # (empty: the text's start - runs next to each other are one)
+        if text[pos].islower() and prev in ".!?\n":
+            out.append(text[pos].upper())
+            pos += 1
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def strip_thinking_fillers(messages: list[dict]) -> list[dict]:
+    """The messages with "hmm" taken out of the earlier turns' thinking (a run config's "strip_thinking_fillers").
+    GLM-5.3-Flash reads its own past thinking back and copies its style: in a long agent session the "Hmm" grows turn
+    by turn until a turn is nothing but "Hmm - hmm." (zai-org/GLM-5#146, #168).  The same text comes out every time
+    for the same thinking, so the conversation cache still matches the earlier turns."""
+    return [dict(m, reasoning_content=strip_filler(m["reasoning_content"]))
+            if m.get("role") == "assistant" and isinstance(m.get("reasoning_content"), str) else m
+            for m in messages]
+
+
 _TOOL_ORDERS: "OrderedDict[frozenset, tuple]" = OrderedDict()   # a set of tool names -> the order it first came in
 _TOOL_ORDERS_LOCK = threading.Lock()
 _TOOL_ORDERS_MAX = 64
