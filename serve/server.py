@@ -85,6 +85,7 @@ from serve.frontend import (CALL_END, CALL_START, MINIMAX_NS, ChatTemplate, Even
                             deepseek_images,
                             effort_kwargs,
                             effort_level, effort_name, literal_tags, mark_literals, media_of, openai_to_messages,
+                            strip_thinking_fillers,
                             unmark_literals, LiteralMemo)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.responses import (ResponseStore, input_items, input_page, normalize_request,  # noqa: E402
@@ -2626,6 +2627,8 @@ class Service:
         # (main sets it: maya_quants.GLM53_MAX_THINK_BUDGET); a budget the user sets on the dashboard clears it.  0 = the
         # same budget at every level (every other model)
         self.think_budget_max = 0
+        # run config `strip_thinking_fillers`: "hmm" taken out of the earlier turns' thinking before it is rendered
+        self.strip_fillers = False
         # (MiniMax-M3.1 closes its reasoning with </mm:think>; its vocabulary may hold a plain "</think>" too)
         # (Hy4-flash with its suffixed </think:..>, which the pack's tokenizer names </think> in what the server reads)
         end = _special_ids("</mm:think>") if getattr(template, "minimax", False) else \
@@ -2696,6 +2699,8 @@ class Service:
         """The template rendered for `messages` and `tools` (+ `suffix`, text the server appends to the prompt) and
         tokenized.  A special token's text inside a message or a tool is encoded as that text; only the literals the
         template (or the suffix) writes are special tokens."""
+        if self.strip_fillers:
+            messages = strip_thinking_fillers(messages)
         memo = prompt_memo_on()
         turn_mark("render_start")
         if memo:
@@ -7558,6 +7563,9 @@ def main() -> int:
     svc.loop_guard = loop_guard_setting(cfg)            # (MAYA_LOOP_GUARD=0 or "loop_guard": false: off)
     if not svc.loop_guard:
         print("[maya] loop guard: off (a request's \"loop_guard\": true turns it on for that request)", flush=True)
+    svc.strip_fillers = cfg.get("strip_thinking_fillers") is True
+    if svc.strip_fillers:
+        print("[maya] earlier turns' thinking: \"hmm\" taken out (strip_thinking_fillers)", flush=True)
     svc.api_key = a.api_key or cfg.get("api_key", "")
     try:
         svc.cors_origins = parse_cors_origins(cfg.get("cors_origins"))
