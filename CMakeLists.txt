@@ -334,8 +334,13 @@ endif()
 # Only built when a GPU backend is on, so the Phase 1 targets keep working without a toolkit.
 if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp src/core/weights.cpp
-                               src/core/layout.cpp)
+                               src/core/layout.cpp src/core/vram_pool.cu)
   target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  # the expert-slot pool (vram_pool.cu) maps its blocks through the driver's VMM calls (cuMem*), CUDA only: a HIP build
+  # takes its plain fallback and needs no driver library
+  if(STRATA_ENABLE_CUDA)
+    target_link_libraries(strata_core PRIVATE CUDA::cuda_driver)
+  endif()
   # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
   # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
   # linker error ("unresolved external symbol cudaGraphInstantiate") names the function rather than the cause.
@@ -454,6 +459,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(glm_moe_rows_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME glm_moe_rows_test COMMAND glm_moe_rows_test)
     set_tests_properties(glm_moe_rows_test PROPERTIES TIMEOUT 60)
+    # the expert-slot pool (src/core/vram_pool.cu): blocks unmapped, mapped back, busy while another allocation holds
+    # the memory, the plain fallback (needs a GPU with ~2 GiB free, no model; STRATA_TEST_DEV picks the card)
+    add_executable(vram_pool_test tests/vram_pool_test.cu)
+    target_link_libraries(vram_pool_test PRIVATE strata_core ${_strata_gpu_runtime_target})
+    add_test(NAME vram_pool_test COMMAND vram_pool_test)
+    set_tests_properties(vram_pool_test PROPERTIES TIMEOUT 120)
   endif()
   # the batched rows' one-launch kernels (hc_rows, kda_layers over the rows, mv_nt) against the per-row kernels, bitwise
   # (random inputs, no model)
