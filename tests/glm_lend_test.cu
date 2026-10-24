@@ -124,6 +124,38 @@ void test_choose() {
     r = glmfast::lend_choose({blk(9, {{5, 1}})}, have, keep, flat, -1);
     CHECK(r.empty(), "bad layer: %s", str(r).c_str());
 
+    // how many blocks a card can lend does not depend on the experts' heat: a chain of seven layers of one slot size,
+    // their regions one after the other in blocks of six slots, so most layers share a block with the next.  A
+    // shared block takes a layer's coldest few slots, the cheapest a slot - taken early it would leave a layer short
+    // of a whole block of its own.  The same count fresh (flat), with the LFU counts rising and with half of each
+    // layer empty (as after a return)
+    {
+        const int nm[7] = {187, 190, 185, 193, 189, 191, 186};
+        std::vector<glmfast::LendBlock> ch;
+        std::vector<int> hv, kp(7, 13);
+        for (int l = 0, pos = 0; l < 7; ++l) {
+            hv.push_back(nm[l]);
+            for (int s = 0; s < nm[l]; ++s, ++pos) {
+                if ((int) ch.size() <= pos / 6) ch.push_back(blk(pos / 6, {}));
+                auto& sp = ch.back().spans;
+                if (sp.empty() || sp.back().first != l) sp.push_back({l, 0});
+                ++sp.back().second;
+            }
+        }
+        std::vector<std::vector<uint64_t>> fl(7), rise(7), part(7);
+        for (int l = 0; l < 7; ++l)
+            for (int s = 0; s < nm[l]; ++s) {
+                fl[(size_t) l].push_back(0);
+                rise[(size_t) l].push_back(1 + (uint64_t) s);
+                part[(size_t) l].push_back(s < nm[l] / 2 ? 0 : 1 + (uint64_t) s);
+            }
+        // (204: the blocks of one layer each layer can give above its 13, then the shared ones the rest still fits)
+        const size_t nf = glmfast::lend_choose(ch, hv, kp, fl, -1).size();
+        const size_t nr = glmfast::lend_choose(ch, hv, kp, rise, -1).size();
+        const size_t np = glmfast::lend_choose(ch, hv, kp, part, -1).size();
+        CHECK(nf == 204 && nr == nf && np == nf, "the chain: %zu blocks flat, %zu rising, %zu half empty", nf, nr, np);
+    }
+
     // the lendable rule capped at the blocks the choice can take
     CHECK(glmfast::lend_capacity(1000 * kMiB, 100 * kMiB, 300 * kMiB, 64 * kMiB, 20) == 576 * kMiB, "rule");
     CHECK(glmfast::lend_capacity(1000 * kMiB, 100 * kMiB, 300 * kMiB, 64 * kMiB, 5) == 320 * kMiB, "cap");

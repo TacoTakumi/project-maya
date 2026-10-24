@@ -948,10 +948,12 @@ struct LendBlock {
 // The blocks to lend: `want` of `cand` (want < 0: as many as can go), in the order taken - fewer when no more can go.
 // have[l]: layer l's main slots not lent; keep[l]: the fewest it keeps; heat[l]: what each of those slots is worth,
 // ascending (an empty slot 0, a resident 1 + its LFU count).  Taking c slots of a layer costs its c coldest (the
-// lending moves a lent slot's expert over a colder one), so each step takes the block of the least worth a slot whose
-// layers all stay at or above their minimum; on equal worth a block of one layer before a shared one (taking a shared
-// block can leave neither layer room for a whole block of its own), then the block whose layers have the most slots
-// above their minimum (the lending spreads over the layers), then the later block (a region's end).
+// lending moves a lent slot's expert over a colder one), so each step takes, of the blocks whose layers all stay at or
+// above their minimum, a block of one layer before a shared one (a shared block takes a layer's coldest few slots, so
+// it is often the cheapest a slot, and taken early it can leave a layer room for one whole block less: the count would
+// follow the heat), then the block of the least worth a slot, then the block whose layers have the most slots above
+// their minimum (the lending spreads over the layers), then the later block (a region's end).  So the blocks of one
+// layer that can go - all a card can lend, but for shared blocks that fit what they leave - do not depend on the heat.
 std::vector<int> lend_choose(const std::vector<LendBlock>& cand, const std::vector<int>& have,
                              const std::vector<int>& keep, const std::vector<std::vector<uint64_t>>& heat, int want);
 // What a card can lend, in bytes: the lendable rule (strata::core::lendable_bytes over the pool, the prompt path's
