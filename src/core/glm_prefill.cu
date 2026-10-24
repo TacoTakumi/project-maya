@@ -1184,9 +1184,8 @@ bool Glm5Model::prefill_setup(std::string& err) {
     if (glmfast::complete_pool_on() && !F->unified_memory && has_moe && stride_sum > 0 &&
         ceiling > 0) {
         const auto pu = prefill_bytes_for((size_t) ceiling);
-        size_t bufs = pu.first + pu.second + (size_t) w16_elems * 2 + (size_t) w32_elems * 4 + ws_bytes + gbuf + 4096;
-        if (const char* v = getenv("STRATA_GLM_VISION_LEND_MB"); v != nullptr && dev_ == 0)
-            bufs = std::max(bufs, (size_t) std::max(0LL, std::atoll(v)) << 20);
+        const size_t bufs =
+            pu.first + pu.second + (size_t) w16_elems * 2 + (size_t) w32_elems * 4 + ws_bytes + gbuf + 4096;
         const size_t margin = std::max<size_t>((size_t) 1 << 30, 2 * stride_sum);
         const int tail = (int) ((bufs + stride_sum - 1) / stride_sum);
         complete = avail > margin &&
@@ -1640,69 +1639,6 @@ bool Glm5Model::prefill_lend(std::string& err) {
     S->pre_layer = -1;
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm prefill lend", err)) return false;
     S->lent = true;
-    return true;
-}
-
-// The on-demand vision encoder (serve VLEND): the whole tail is emptied the same way and its memory freed, so the
-// encoder's process can allocate it; the prompt path waits (token by token) until vision_reclaim gives it back.
-bool Glm5Model::vision_lend(size_t& bytes, std::string& err) {
-    FastState* F = fast_;
-    bytes = 0;
-    if (F == nullptr || !vis_lend_ok_) {
-        err = "this engine has no pool tail to lend to the vision encoder";
-        return false;
-    }
-    if (vis_lent_) {
-        bytes = F->xpool_bytes;
-        return true;
-    }
-    cudaSetDevice(dev_);
-    uint64_t moved = 0, dropped = 0;
-    if (!lend_tail(F->xpool_bytes, moved, dropped, err)) return false;
-    cudaFree(F->xpool);
-    F->xpool = nullptr;
-    for (auto& P : F->lp) P.xbase = nullptr;
-    vis_lent_ = true;
-    bytes = F->xpool_bytes;
-    std::fprintf(stderr, "glm fast: CUDA%d %.2f GB lent to the vision encoder (%llu experts moved to colder slots, "
-                         "%llu dropped)\n", dev_, (double) bytes / 1073741824.0, (unsigned long long) moved,
-                 (unsigned long long) (dropped - moved));
-    return true;
-}
-
-size_t Glm5Model::vision_lend_bytes() const { return fast_ != nullptr && vis_lend_ok_ ? fast_->xpool_bytes : 0; }
-
-// ... and back once the encoder has ended: the tail is allocated again (false while the memory is still taken) and
-// its slots are free - the decode's misses refill them
-bool Glm5Model::vision_reclaim(std::string& err) {
-    FastState* F = fast_;
-    if (F == nullptr || !vis_lent_) return true;
-    cudaSetDevice(dev_);
-    if (cudaMalloc(&F->xpool, F->xpool_bytes) != cudaSuccess) {
-        cudaGetLastError();
-        F->xpool = nullptr;
-        err = "the pool's tail is not free yet";
-        return false;
-    }
-    uint8_t* b = F->xpool;
-    for (int il = l0_; il < lt_; ++il) {
-        if (!F->L[(size_t) il].moe) continue;
-        auto& P = F->lp[(size_t) il];
-        P.xbase = b;
-        b += (size_t) (P.n - P.n_main) * P.stride;
-    }
-    if (pf_ != nullptr && !prefill_bind(F->xpool, F->xpool_bytes, err)) return false;
-    {
-        std::lock_guard<std::mutex> lk(F->mu);
-        for (int il = l0_; il < lt_; ++il) {
-            auto& P = F->lp[(size_t) il];
-            for (int s = P.n_main; s < P.n; ++s)
-                if (P.st[(size_t) s] == FastState::kLent) P.st[(size_t) s] = FastState::kFree;
-        }
-    }
-    vis_lent_ = false;
-    std::fprintf(stderr, "glm fast: CUDA%d the vision encoder's %.2f GB are back in the expert pool\n", dev_,
-                 (double) F->xpool_bytes / 1073741824.0);
     return true;
 }
 
@@ -4252,8 +4188,8 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     err.clear();
     prefill_next_ = next_token;
     if (fast_ == nullptr || tokens.empty()) return false;
-    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())   // (a tail lent to the vision encoder: the
-        if (m->pf_ == nullptr || m->fast_ == nullptr || m->vis_lent_) return false;   // token path, until it is back)
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+        if (m->pf_ == nullptr || m->fast_ == nullptr) return false;
     // a handful of tokens costs less through the token path (the batched path streams every expert they touch).  One
     // GPU: from 8 tokens - an agent session's later turns (13.5K of history + a short user turn, Maya-S24 on a V100,
     // two cooled rounds of three turns): prompt 1,041 / 648 / 521 ms at 32 -> 488 / 405 / 577 at 8 (4: 508 / 397 /

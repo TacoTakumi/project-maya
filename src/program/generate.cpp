@@ -1101,24 +1101,24 @@ static int glm_pack_generate(const Options& o) {
         // (+ the CPU lane setup's calibration reads: its threads and its PCIe share, as the engine started, and the most
         // threads a request's cpu_threads gets - its pool's size)
         std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld engine_kind=glm-fast "
-                    "experts=%d vram_slots=%lld vram_gb=%.1f ram_slots=%lld ram_gb=%.1f mtp=%d dflash=%d vision_lend=%zu "
+                    "experts=%d vram_slots=%lld vram_gb=%.1f ram_slots=%lld ram_gb=%.1f mtp=%d dflash=%d "
                     "cpu_threads=%d cpu_threads_max=%d pcie_share=%.2f logit_bias=1\n",
                     (long long) o.max_context, model.kv_int8() ? "int8" : "fp16", (long long) model.kv_resident(),
                     (long long) st.pool_slots,
                     (long long) (st.pool_gb * 1024.0), model.geometry().n_expert * (model.geometry().n_layers - model.geometry().dense_lead),
                     (long long) st.pool_slots, st.pool_gb, (long long) st.ram_slots, st.ram_gb, model.has_mtp() ? 1 : 0,
-                    model.dflash_ready() ? 1 : 0, model.vision_lend_bytes(), model.cpu_lane_threads(),
+                    model.dflash_ready() ? 1 : 0, model.cpu_lane_threads(),
                     model.cpu_lane_threads_max(), model.pcie_share());
         // the Monitor's map of each GPU: what each part holds on its card, in bytes (Glm5Model::VramReport) - the
         // server finds the card NVML numbers by its PCI address and adds what NVML sees besides
         for (const auto& r : model.vram_report())
             std::printf("VRAM dev=%d pci=%s total=%llu free=%llu weights=%llu kv=%llu kv_ram=%llu act=%llu drafter=%llu "
-                        "window=%llu pool=%llu tail=%llu borrow=%llu vision=%llu slots=%lld ctx=%lld layers=%d-%d\n",
+                        "window=%llu pool=%llu tail=%llu borrow=%llu slots=%lld ctx=%lld layers=%d-%d\n",
                         r.dev, r.pci.empty() ? "-" : r.pci.c_str(), (unsigned long long) r.total,
                         (unsigned long long) r.free, (unsigned long long) r.weights, (unsigned long long) r.kv,
                         (unsigned long long) r.kv_ram, (unsigned long long) r.act, (unsigned long long) r.drafter,
                         (unsigned long long) r.window, (unsigned long long) r.pool, (unsigned long long) r.tail,
-                        (unsigned long long) r.borrow, (unsigned long long) r.vision, (long long) r.slots,
+                        (unsigned long long) r.borrow, (long long) r.slots,
                         (long long) r.ctx, r.l0, r.l1);
         // (Windows on an APU: the commit - the page file - kept experts off the GPU; the server's log, Monitor and
         // /v1/status say so, as for DeepSeek's engine)
@@ -4208,7 +4208,7 @@ static int glm_pack_generate(const Options& o) {
         std::string cmd;
         ss >> cmd;
         if (cmd == "QUIT") break;
-        if (multi && !gens.empty() && (cmd == "VLEND" || cmd == "VRECLAIM" || cmd == "LOGP")) {
+        if (multi && !gens.empty() && cmd == "LOGP") {
             std::printf("ERR %s needs the engine idle (%zu requests running)\n", cmd.c_str(), gens.size());
             continue;
         }
@@ -4225,22 +4225,6 @@ static int glm_pack_generate(const Options& o) {
         // ("LP <sum> <n> <1 if every one was the most likely>") - the multiple-choice scoring of the zero-shot suite
         // (tools/maya_quant/zs_tasks.py).  A context identical to the previous request's is restored, not read again
         // (the choices of one question share it).
-        // VLEND / VRECLAIM (between requests): the on-demand vision encoder is about to start on the first GPU - the
-        // expert pool's tail is emptied and freed for it ("VLENT <bytes>") - and has ended ("VRECLAIMED"; an ERR while
-        // its memory is not free yet: try again)
-        if (cmd == "VLEND") {
-            size_t lent = 0;
-            if (model.vision_lend(lent, err)) std::printf("VLENT %zu\n", lent);
-            else std::printf("ERR %s\n", err.c_str());
-            std::fflush(stdout);
-            continue;
-        }
-        if (cmd == "VRECLAIM") {
-            if (model.vision_reclaim(err)) std::printf("VRECLAIMED\n");
-            else std::printf("ERR %s\n", err.c_str());
-            std::fflush(stdout);
-            continue;
-        }
         if (cmd == "LOGP") {
             int64_t n_ctx = 0;
             std::string ids_s;
@@ -4480,8 +4464,7 @@ static int glm_pack_generate(const Options& o) {
             continue;
         }
         if (cmd.empty()) continue;
-        std::printf("ERR unsupported command '%s' (GEN, GENI, LOGP, VLEND, VRECLAIM, STOP, QUIT, LEND, RETURN and "
-                    "LENDABLE)\n", cmd.c_str());
+        std::printf("ERR unsupported command '%s' (GEN, GENI, LOGP, STOP, QUIT, LEND, RETURN and LENDABLE)\n", cmd.c_str());
     }
     // the engine ends (QUIT, or the server gone): the conversation in the model is kept for the next start
     if (multi) {   // the requests still running end here (their DONE lines), then every context's conversation

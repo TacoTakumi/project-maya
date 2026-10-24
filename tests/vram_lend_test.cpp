@@ -201,8 +201,8 @@ int main() {
     CHECK(eng.leases.size() == 1);
 
     // ---- not a lend command: false and no reply, for the engine's own loop to handle
-    for (const char* other : {"", "   ", "GEN 1 2 3", "QUIT", "STOP", "VLEND", "VRECLAIM", "LENDX 0 10", "lend 0 10",
-                              "RETURNED 1", "LENDABLES"}) {
+    for (const char* other : {"", "   ", "GEN 1 2 3", "QUIT", "STOP", "LOGP 2 1,2,3", "GENI 1 2", "LENDX 0 10",
+                              "lend 0 10", "RETURNED 1", "LENDABLES"}) {
         std::string o = "stale";
         CHECK(!desk.handle(other, o));
         CHECK(o.empty());
@@ -226,7 +226,7 @@ int main() {
         CHECK(lend_line_kind(l) == LendLineKind::lendable);
     for (const char* l : {"LEND 0 64", "LEND", "LEND x 10", " RETURN 7", "RETURN", "RETURN 1 2", "LEND 0 64\r"})
         CHECK(lend_line_kind(l) == LendLineKind::change);
-    for (const char* l : {"", "   ", "GEN 1 2 3", "QUIT", "STOP", "STOP 3", "PAUSE keep", "VLEND", "VRECLAIM",
+    for (const char* l : {"", "   ", "GEN 1 2 3", "QUIT", "STOP", "STOP 3", "PAUSE keep", "LOGP 2 1,2,3", "GENI 1 2",
                           "LENDX 0 10", "lend 0 10", "RETURNED 1", "LENDABLES", "LENT 1 0 64", "END", "X LEND 0 64"})
         CHECK(lend_line_kind(l) == LendLineKind::none);
 

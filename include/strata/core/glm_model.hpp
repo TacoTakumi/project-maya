@@ -142,14 +142,14 @@ public:
     /// and free memory now, its PCI address (the server finds the GPU NVML numbers by it), the dense weights, the
     /// sequence state (the DSA latent cache, KDA states, indexer keys; kv_ram: KV streaming's pinned copy in RAM), the
     /// activations, a drafter's weights (DFlash or the NextN block) and the verify window's buffers, the expert pool
-    /// with its lendable tail and what a prompt (borrow, at most) or the vision encoder borrows of that tail.  The
-    /// CUDA context and the small buffers are not counted: total - free - the parts.
+    /// with its lendable tail and what a prompt borrows of that tail (borrow, at most).  The CUDA context and the small
+    /// buffers are not counted: total - free - the parts.
     struct VramReport {
         int dev = 0;
         std::string pci;
         uint64_t total = 0, free = 0;
         uint64_t weights = 0, kv = 0, kv_ram = 0, act = 0, drafter = 0, window = 0;
-        uint64_t pool = 0, tail = 0, borrow = 0, vision = 0;
+        uint64_t pool = 0, tail = 0, borrow = 0;
         int64_t slots = 0, ctx = 0;
         int l0 = 0, l1 = 0;
     };
@@ -272,12 +272,6 @@ public:
     /// closes the reasoning block this way inside the running decode - the speculative loop takes it as the truth
     /// for its position, like a rejected draft, so nothing is read again.
     void force_next(int32_t tok) { force_tok_ = tok; }
-    /// The on-demand vision encoder (serve VLEND / VRECLAIM; STRATA_GLM_VISION_LEND_MB at load): the first GPU's
-    /// lendable pool tail is emptied and freed so the encoder's process can use that VRAM, and allocated again
-    /// once it has ended (false while the memory is still taken).  vision_lend_bytes(): 0 when unavailable.
-    bool vision_lend(size_t& bytes, std::string& err);
-    bool vision_reclaim(std::string& err);
-    size_t vision_lend_bytes() const;
     int32_t forced(int32_t sampled) {
         int32_t t = force_tok_ >= 0 ? force_tok_ : sampled;
         force_tok_ = -1;
@@ -1029,8 +1023,6 @@ public:
     // (Strata's floor); STRATA_GLM_PREFILL_KEEP lowers it, never below route + spares
     static int pool_keep(int n_exp_used);
     bool lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std::string& err);
-    bool vis_lend_ok_ = false;                             // this half's tail can go to the vision encoder
-    bool vis_lent_ = false;                                // ... and is with it now (freed)
     // this half's layers over a chunk (rows in pf_->R); next_ids / next_img: the NextN block's next tokens and, where
     // one is an <|image|>, the image row standing for it (null: its token embedding)
     bool prefill_half(int64_t p0, int T, std::string& err, const int32_t* next_ids = nullptr,
@@ -1095,12 +1087,12 @@ size_t glm_prefill_lend_bytes(const Glm5Geometry& g, size_t T, bool has_kda, boo
 ///
 /// When to call.  lend() and give_back() only from the engine's own command loop (the thread that runs requests),
 /// between scheduler steps, with nothing in flight on any part: no token, verify window or draft issued and not yet
-/// taken, no prompt read (its pool tail lent) and no prompt gap.  One sequence: between requests, where VLEND is taken
-/// now.  Several sequences (STRATA_GLM_SEQS, glm_multi.cu): at the top of the serve loop after the scheduler's drain
-/// (every issued token and window taken back, as before multi_boundary), never from inside prefill_gap.  lend() runs
-/// each part's fast_boundary itself with the background moves held, so no boundary is needed around it; the decode
-/// then goes on with the new tables.  lend_cards() reads under each part's lock and may be called whenever the loop
-/// takes a command line.  None of the three is safe from another thread.
+/// taken, no prompt read (its pool tail lent) and no prompt gap.  One sequence: between requests.  Several sequences
+/// (STRATA_GLM_SEQS, glm_multi.cu): at the top of the serve loop after the scheduler's drain (every issued token and
+/// window taken back, as before multi_boundary), never from inside prefill_gap.  lend() runs each part's
+/// fast_boundary itself with the background moves held, so no boundary is needed around it; the decode then goes on
+/// with the new tables.  lend_cards() reads under each part's lock and may be called whenever the loop takes a
+/// command line.  None of the three is safe from another thread.
 std::unique_ptr<VramLender> make_glm_lender(Glm5Model& head);
 
 }  // namespace strata::core
