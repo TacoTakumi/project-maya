@@ -2342,9 +2342,10 @@ static int glm_pack_generate(const Options& o) {
             return true;
         };
         // after a lend stop: the state read on to the last token written, its logits on the tail as after a prompt's
-        // last token.  The decode stopped with the state at the tokens it had read - every written token but the last
-        // one or few, as for a PAUSE - and those are read now; where it had read them all (a DFlash window that kept
-        // the token it stopped at) the logits after the last are gone, and the state is read again from the prompt's
+        // last token.  Every decode path stops with the state at every written token but the last (the token loop,
+        // MTP and the pipelined decode before reading it, DFlash with a kept draft it stopped at left out of the
+        // commit), so this reads that one token - the read the decode would have made next.  Should the state stand
+        // elsewhere - every written token read, the logits after the last gone - it is read again from the prompt's
         // snapshot (from the start without one)
         const auto lend_resume = [&](std::string& e) -> bool {
             std::vector<int32_t> seq(prompt);

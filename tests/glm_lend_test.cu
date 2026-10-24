@@ -4,9 +4,12 @@
 //  - lend_capacity: the lendable rule, capped at the blocks the choice can take;
 //  - on a GPU (STRATA_TEST_DEV, default 0; skipped without one): a synthetic part - two layers of main slots on a real
 //    VMM pool sharing a block, the device slot table, a RAM tier of two slots - lends two blocks: the lent slots'
-//    experts move over colder ones (bytes and table entries checked), the colder ones go to RAM or to disk, a spare
-//    leaves the spare table, every lent slot is kLent and in no table; the blocks unmap (the card's free memory rises by
-//    them), map back and the slots are free; a slot still draining refuses the lend and changes nothing;
+//    experts move over colder ones (bytes and table entries checked), the leaving ones go to RAM hottest first, the
+//    rest to disk, a spare leaves the spare table, every lent slot is kLent and in no table; the blocks unmap (the
+//    card's free memory rises by them), map back and the slots are free; a slot still draining refuses the lend and
+//    changes nothing;
+//  - the RAM tier's share of a lend (lend_park_budget, STRATA_GLM_LEND_PARK_MB): with a budget of one slot only the
+//    hottest leaving expert is copied to RAM, with none every one goes to disk, the moves the same either way;
 //  - the lender (make_glm_lender) and the lend commands over two such parts behind Glm5Model shells, a split on one
 //    card (and with STRATA_TEST_DEV2=<n> a second run with the second part on card n): each card's lendable, a lend
 //    whose blocks free the card's memory (on one card shared by the parts), a return refused as busy while another
@@ -127,6 +130,22 @@ void test_choose() {
     CHECK(glmfast::lend_capacity(1000 * kMiB, 100 * kMiB, 300 * kMiB, 0, 5) == 0, "no blocks");
     CHECK(glmfast::lend_capacity(300 * kMiB, 100 * kMiB, 300 * kMiB, 64 * kMiB, 5) == 0, "under the minimum");
     CHECK(glmfast::lend_capacity(1000 * kMiB, 100 * kMiB, 300 * kMiB, 64 * kMiB, 0) == 0, "no block can go");
+}
+
+// ---- the RAM tier's share of a lend: STRATA_GLM_LEND_PARK_MB, 512 MiB by default (host only)
+void test_park_budget() {
+    unsetenv("STRATA_GLM_LEND_PARK_MB");
+    CHECK(glmfast::lend_park_budget() == 512 * kMiB, "default %zu", glmfast::lend_park_budget());
+    setenv("STRATA_GLM_LEND_PARK_MB", "0", 1);
+    CHECK(glmfast::lend_park_budget() == 0, "0: every leaving expert to disk, %zu", glmfast::lend_park_budget());
+    setenv("STRATA_GLM_LEND_PARK_MB", "2048", 1);
+    CHECK(glmfast::lend_park_budget() == 2048 * kMiB, "2048: %zu", glmfast::lend_park_budget());
+    for (const char* bad : {"-1", "x", "", "12x"}) {
+        setenv("STRATA_GLM_LEND_PARK_MB", bad, 1);
+        CHECK(glmfast::lend_park_budget() == 512 * kMiB, "'%s' is not a size: the default, %zu", bad,
+              glmfast::lend_park_budget());
+    }
+    unsetenv("STRATA_GLM_LEND_PARK_MB");
 }
 
 // ---- a synthetic part on a real pool
@@ -306,9 +325,10 @@ void test_part(int dev) {
     glmfast::LendCounts c;
     err.clear();
     CHECK(glmfast::lend_take(F, 0, NL, NE, blocks, c, err), "lend_take: %s", err.c_str());
-    // layer 0 lends slots 4-7 (experts 4-7): 7 into the spare's slot 9, 6 / 5 / 4 over experts 0 / 1 / 2 - 0 and 1
-    // to the RAM tier's two slots, 2 to disk (the RAM tier is full of this lend's own experts).  Layer 1 lends slots
-    // 6-9 (experts 6, 7, 9; slot 8 empty): 9 / 7 / 6 over experts 0 / 1 / 2, which go to disk.
+    // layer 0 lends slots 4-7 (experts 4-7): 7 into the spare's slot 9, 6 / 5 / 4 over experts 0 / 1 / 2.  Layer 1
+    // lends slots 6-9 (experts 6, 7, 9; slot 8 empty): 9 / 7 / 6 over experts 0 / 1 / 2.  Of the six that leave VRAM
+    // the hottest two - layer 1's experts 2 and 1 (counts 102, 101) - take the RAM tier's two slots, the other four go
+    // to disk (the RAM tier is full of this lend's own experts)
     CHECK(c.slots == 8 && c.moved == 7 && c.parked == 2 && c.dropped == 4, "counts: slots %d moved %llu parked %llu "
           "dropped %llu", c.slots, (unsigned long long) c.moved, (unsigned long long) c.parked,
           (unsigned long long) c.dropped);
@@ -338,9 +358,12 @@ void test_part(int dev) {
         }
     CHECK(F.slot_of[0] < 0 && F.slot_of[1] < 0 && F.slot_of[2] < 0, "layer 0 experts 0-2 left VRAM");
     CHECK(F.slot_of[NE + 0] < 0 && F.slot_of[NE + 1] < 0 && F.slot_of[NE + 2] < 0, "layer 1 experts 0-2 left VRAM");
-    CHECK(F.ram_of[0] >= 0 && F.ram_of[1] >= 0 && F.ram_of[2] < 0 && F.ram_of[NE] < 0, "the RAM tier: %d %d %d %d",
-          F.ram_of[0], F.ram_of[1], F.ram_of[2], F.ram_of[NE]);
-    CHECK(F.left[2] == 3 && F.left[NE] == 3, "dropped experts' cause");
+    CHECK(F.ram_of[NE + 2] >= 0 && F.ram_of[NE + 1] >= 0 && F.ram_of[0] < 0 && F.ram_of[1] < 0 && F.ram_of[2] < 0 &&
+              F.ram_of[NE] < 0,
+          "the RAM tier: %d %d | %d %d %d %d", F.ram_of[NE + 2], F.ram_of[NE + 1], F.ram_of[0], F.ram_of[1],
+          F.ram_of[2], F.ram_of[NE]);
+    CHECK(F.left[0] == 3 && F.left[1] == 3 && F.left[2] == 3 && F.left[NE] == 3, "dropped experts' cause");
+    CHECK(c.park_bytes == 2 * kStride, "parked bytes %zu", c.park_bytes);
     // the device table as the routes will read it
     {
         const size_t nt = 2 * (size_t) F.n_keys + (size_t) NL * gf::kSpares;
@@ -362,9 +385,9 @@ void test_part(int dev) {
         if (want0[s] >= 0) CHECK(slot_has(ptr0[(size_t) s], tag(0, want0[s])), "layer 0 slot %d bytes", s);
         if (want1[s] >= 0) CHECK(slot_has(ptr1[(size_t) s], tag(1, want1[s])), "layer 1 slot %d bytes", s);
     }
-    for (int e = 0; e < 2; ++e) {
-        const uint8_t* h = F.rc[0].slot((size_t) F.ram_of[(size_t) e]);
-        CHECK(h[0] == tag(0, e) && h[kStride - 1] == tag(0, e), "RAM copy of layer 0 expert %d", e);
+    for (int e = 1; e < 3; ++e) {
+        const uint8_t* h = F.rc[0].slot((size_t) F.ram_of[(size_t) (NE + e)]);
+        CHECK(h[0] == tag(1, e) && h[kStride - 1] == tag(1, e), "RAM copy of layer 1 expert %d", e);
     }
     // the lent blocks are no candidates any more; the three left cannot go (both layers at their minimum)
     v = glmfast::lend_view(F, 0, NL, NE, 6);
@@ -393,6 +416,60 @@ void test_part(int dev) {
     CHECK(slot_has(F.lp[1].slot_ptr(9), 0x5a), "a returned slot is writable");
     v = glmfast::lend_view(F, 0, NL, NE, 6);
     CHECK(v.cand.size() == 5 && v.have == (std::vector<int>{10, 10}), "view after the return");
+    CHECK(cudaDeviceSynchronize() == cudaSuccess, "device: %s", cudaGetErrorString(cudaGetLastError()));
+}
+
+// the same lend with a park budget: `budget` bytes of the leaving experts to RAM, the hottest first
+void test_part_budget(int dev, size_t budget, int want_parked) {
+    std::printf("a lend with a park budget of %zu MiB\n", budget >> 20);
+    cudaSetDevice(dev);
+    Part part;
+    std::string err;
+    if (!setup(part, dev, err)) {
+        std::printf("SKIP the GPU part: %s\n", err.c_str());
+        return;
+    }
+    FastState& F = *part.F;
+    const std::vector<int> blocks{1, 4};
+    glmfast::LendCounts c;
+    CHECK(glmfast::lend_take(F, 0, NL, NE, blocks, c, err, budget), "lend_take: %s", err.c_str());
+    CHECK(c.slots == 8 && c.moved == 7 && (int) c.parked == want_parked && (int) c.dropped == 6 - want_parked &&
+              c.park_bytes == (size_t) want_parked * kStride,
+          "counts: moved %llu parked %llu dropped %llu (%zu bytes)", (unsigned long long) c.moved,
+          (unsigned long long) c.parked, (unsigned long long) c.dropped, c.park_bytes);
+    // the hottest leaving expert (layer 1's expert 2) is the one in RAM; the rest on disk
+    const int hot[2] = {NE + 2, NE + 1};
+    for (int i = 0; i < 2; ++i)
+        CHECK((F.ram_of[(size_t) hot[i]] >= 0) == (i < want_parked), "key %d in RAM: %d", hot[i], F.ram_of[(size_t) hot[i]]);
+    for (int key : {0, 1, 2, NE}) CHECK(F.ram_of[(size_t) key] < 0 && F.left[(size_t) key] == 3, "key %d to disk", key);
+    if (want_parked > 0) {
+        const uint8_t* h = F.rc[0].slot((size_t) F.ram_of[NE + 2]);
+        CHECK(h[0] == tag(1, 2) && h[kStride - 1] == tag(1, 2), "RAM copy of layer 1 expert 2");
+    }
+    // the moves do not depend on the budget: the same experts in the same slots, their bytes there
+    const int want0[kMain] = {6, 5, 4, 3, -1, -1, -1, -1, 8, 7};
+    const int want1[kMain] = {9, 7, 6, 3, 4, 5, -1, -1, -1, -1};
+    for (int s = 0; s < kMain; ++s) {
+        CHECK(F.lp[0].key[(size_t) s] == want0[s] && F.lp[1].key[(size_t) s] == want1[s], "slot %d holds %d, %d", s,
+              F.lp[0].key[(size_t) s], F.lp[1].key[(size_t) s]);
+        if (want0[s] >= 0) CHECK(slot_has(F.lp[0].slot_ptr(s), tag(0, want0[s])), "layer 0 slot %d bytes", s);
+        if (want1[s] >= 0) CHECK(slot_has(F.lp[1].slot_ptr(s), tag(1, want1[s])), "layer 1 slot %d bytes", s);
+    }
+    {
+        const size_t nt = 2 * (size_t) F.n_keys + (size_t) NL * gf::kSpares;
+        std::vector<unsigned long long> th(nt);
+        cudaMemcpy(th.data(), F.tab, nt * sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+        for (int key = 0; key < NL * NE; ++key) {
+            const int il = key / NE, s = F.slot_of[(size_t) key], rs = F.ram_of[(size_t) key];
+            CHECK(th[F.tab_key(key)] == (s >= 0 ? (unsigned long long) F.lp[(size_t) il].slot_ptr(s) : 0ull), "tab %d",
+                  key);
+            CHECK(th[F.rtab_key(key)] == (rs >= 0 ? (unsigned long long) F.rc[0].slot((size_t) rs) : 0ull), "rtab %d",
+                  key);
+        }
+    }
+    CHECK(glmfast::lend_unmap(F, dev, blocks, err), "lend_unmap: %s", err.c_str());
+    CHECK(F.vpool.map(blocks, err) == VramPool::Result::Ok, "map: %s", err.c_str());
+    glmfast::lend_free(F, blocks);
     CHECK(cudaDeviceSynchronize() == cudaSuccess, "device: %s", cudaGetErrorString(cudaGetLastError()));
 }
 
@@ -565,6 +642,7 @@ void test_lender(int da, int db) {
 
 int main() {
     test_choose();
+    test_park_budget();
     int dev = 0, n = 0;
     if (const char* e = std::getenv("STRATA_TEST_DEV")) dev = std::atoi(e);
     if (cudaGetDeviceCount(&n) != cudaSuccess || n <= dev) {
@@ -572,6 +650,8 @@ int main() {
         std::printf("SKIP the GPU part: no CUDA device %d\n", dev);
     } else {
         test_part(dev);
+        test_part_budget(dev, kStride + kStride / 2, 1);   // one slot's worth and a half: one expert
+        test_part_budget(dev, 0, 0);
         test_lender(dev, dev);
         // STRATA_TEST_DEV2=<n>: the split's second part on that card
         if (const char* e = std::getenv("STRATA_TEST_DEV2"); e != nullptr && std::atoi(e) != dev && std::atoi(e) < n)

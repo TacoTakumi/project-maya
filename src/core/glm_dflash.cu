@@ -1984,7 +1984,11 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
                 break;
             }
         }
-        const int keep = 1 + kept;
+        // the rows kept: the last emitted token and those before it - but where the caller stopped at a kept draft
+        // (a STOP, a PAUSE, a LEND or RETURN, the length) that draft stays unread, as every other way out of here
+        // leaves the state: every written token read but the last, so the caller goes on by reading one token (with
+        // all of them read, the logits after the last would be gone and the caller would read the answer again)
+        const int keep = more ? 1 + kept : kept;
         const int y2 = forced(out[(size_t) keep - 1]);
         if (pipe && more && ahead_on) {   // the next round's injection and draft (see ahead)
             const int64_t N2 = N + keep;

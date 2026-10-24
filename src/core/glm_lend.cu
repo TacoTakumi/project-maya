@@ -21,6 +21,12 @@
 // minimum; the prompt path's own borrow is never touched, and a lend cannot push it back to token by token.  A card
 // with several parts lends what they lend together (the parts of its first part's block size).
 //
+// Where their experts go.  A lent slot's expert moves into an empty slot of its layer or over a colder resident (a
+// device copy, cheap); whatever leaves VRAM - that colder one, or the lent slot's own expert where no slot is colder -
+// goes to the RAM tier hottest first while the lend's park budget lasts (lend_park_budget: STRATA_GLM_LEND_PARK_MB,
+// 512 MiB), the rest to disk.  The decode is stopped for the lend, and a D2H copy of 8 GiB of experts over a PCIe 4.0
+// x4 link took 1.9 s of it; dropped experts cost nothing now and are read from disk when a route wants them.
+//
 // Which blocks.  lend_choose, one block at a time: the one whose leaving costs least a slot.  A layer that loses c
 // slots loses its c coldest experts (a lent slot's expert moves into an empty slot of its layer or over a colder
 // resident), so the cost is the layer's c coldest slots' worth (an empty slot 0, a resident 1 + its aged LFU count).
@@ -38,8 +44,12 @@
 
 #include "strata/core/vram_lend.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <climits>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 
 namespace strata::core {
@@ -150,8 +160,18 @@ LendView lend_view(Glm5Model::FastState& F, int l0, int lt, int n_expert, int ke
     return v;
 }
 
+size_t lend_park_budget() {
+    constexpr size_t kDefault = (size_t) 512 << 20;
+    const char* v = std::getenv("STRATA_GLM_LEND_PARK_MB");
+    if (v == nullptr || v[0] < '0' || v[0] > '9') return kDefault;
+    char* end = nullptr;
+    const unsigned long long mb = std::strtoull(v, &end, 10);
+    if (*end != '\0' || mb > ((unsigned long long) SIZE_MAX >> 20)) return kDefault;
+    return (size_t) mb << 20;
+}
+
 bool lend_take(Glm5Model::FastState& F, int l0, int lt, int n_expert, const std::vector<int>& blocks, LendCounts& c,
-               std::string& err) {
+               std::string& err, size_t park_max) {
     using FS = Glm5Model::FastState;
     const int NE = n_expert;
     std::lock_guard<std::mutex> lk(F.mu);
@@ -224,9 +244,10 @@ bool lend_take(Glm5Model::FastState& F, int l0, int lt, int n_expert, const std:
         if ((size_t) key < F.left.size()) F.left[(size_t) key] = why;
     };
     // an expert that leaves VRAM goes to the RAM tier where it has room - a free slot, else over a colder held expert
-    // (one this lend parked is never the victim) - so the decode finds it in RAM, not on disk; false: it is dropped
+    // (one this lend parked is never the victim) - so the decode finds it in RAM, not on disk; false: it is dropped.
+    // `tick`: its recency in the slot it leaves
     std::vector<char> parked;
-    const auto park = [&](int il, int s, int key) -> bool {
+    const auto park = [&](int il, int s, int key, uint64_t tick) -> bool {
         const int rc = (size_t) il < F.layer_rc.size() ? F.layer_rc[(size_t) il] : -1;
         if (rc < 0 || (size_t) rc >= F.rc.size()) return false;
         if (parked.empty()) parked.assign(F.ram_of.size(), 0);
@@ -236,7 +257,7 @@ bool lend_take(Glm5Model::FastState& F, int l0, int lt, int n_expert, const std:
             if (R.st[(size_t) s2] == FS::kRFree) rs = s2;
         if (rs < 0) {
             uint32_t bc = F.cnt[(size_t) key];
-            uint64_t bt = F.lp[(size_t) il].tick[(size_t) s];
+            uint64_t bt = tick;
             for (int s2 = 0; s2 < R.n; ++s2) {
                 if (R.st[(size_t) s2] != FS::kRHold || parked[(size_t) R.key[(size_t) s2]]) continue;
                 const uint32_t c2 = F.cnt[(size_t) R.key[(size_t) s2]];
@@ -274,9 +295,22 @@ bool lend_take(Glm5Model::FastState& F, int l0, int lt, int n_expert, const std:
                 upd(F.spare_key(il, j), 0ull);
             }
     };
+    // the plan first, on the host: where each lent slot's expert goes and which experts leave VRAM (a leaving one's
+    // slot still holds it: a victim's until its move below, a lent slot's until the unmap).  Then the leaving ones'
+    // copies to RAM, hottest first within the budget, and only then the moves, which overwrite the victims' slots
+    // (all on F.cs, in that order)
+    struct Leave {
+        int il, s, key;
+        uint32_t cnt;
+        uint64_t tick;
+    };
+    struct Move {
+        int il, from, to;
+    };
+    std::vector<Leave> leaving;
+    std::vector<Move> moves;
     for (auto& [il, m] : in) {
         auto& P = F.lp[(size_t) il];
-        const size_t blob = F.L[(size_t) il].blob;
         const auto colder = [&](int a, int b) {   // slot a's expert before slot b's, coldest first
             const uint32_t ca = F.cnt[(size_t) il * NE + P.key[(size_t) a]], cb = F.cnt[(size_t) il * NE + P.key[(size_t) b]];
             return ca != cb ? ca < cb : P.tick[(size_t) a] < P.tick[(size_t) b];
@@ -308,17 +342,11 @@ bool lend_take(Glm5Model::FastState& F, int l0, int lt, int n_expert, const std:
                 const int vkey = il * NE + P.key[(size_t) t];
                 upd(F.tab_key(vkey), 0ull);
                 F.slot_of[(size_t) vkey] = -1;
-                if (park(il, t, vkey)) ++c.parked;   // (read before the copy below overwrites the slot)
-                else {
-                    left(vkey, 3);
-                    ++c.dropped;
-                }
+                leaving.push_back({il, t, vkey, F.cnt[(size_t) vkey], P.tick[(size_t) t]});
             }
             if (!ok) return false;
             if (t >= 0) {
-                if (!cuda_ok(cudaMemcpyAsync(P.slot_ptr(t), P.slot_ptr(s), blob, cudaMemcpyDeviceToDevice, F.cs),
-                             "glm lend move", err))
-                    return false;
+                moves.push_back({il, s, t});
                 upd(F.tab_key(key), (unsigned long long) P.slot_ptr(t));
                 F.slot_of[(size_t) key] = t;
                 P.key[(size_t) t] = P.key[(size_t) s];
@@ -328,11 +356,7 @@ bool lend_take(Glm5Model::FastState& F, int l0, int lt, int n_expert, const std:
             } else {
                 upd(F.tab_key(key), 0ull);
                 F.slot_of[(size_t) key] = -1;
-                if (park(il, s, key)) ++c.parked;
-                else {
-                    left(key, 3);
-                    ++c.dropped;
-                }
+                leaving.push_back({il, s, key, F.cnt[(size_t) key], P.tick[(size_t) s]});
                 if (!ok) return false;
             }
         }
@@ -344,6 +368,26 @@ bool lend_take(Glm5Model::FastState& F, int l0, int lt, int n_expert, const std:
             ++P.n_lent;
             ++c.slots;
         }
+    }
+    std::stable_sort(leaving.begin(), leaving.end(), [](const Leave& a, const Leave& b) {
+        return a.cnt != b.cnt ? a.cnt > b.cnt : a.tick > b.tick;
+    });
+    for (const Leave& x : leaving) {
+        const size_t blob = F.L[(size_t) x.il].blob;
+        if (blob <= park_max - c.park_bytes && park(x.il, x.s, x.key, x.tick)) {
+            ++c.parked;
+            c.park_bytes += blob;
+        } else {
+            if (!ok) return false;
+            left(x.key, 3);
+            ++c.dropped;
+        }
+    }
+    for (const Move& mv : moves) {
+        const auto& P = F.lp[(size_t) mv.il];
+        if (!cuda_ok(cudaMemcpyAsync(P.slot_ptr(mv.to), P.slot_ptr(mv.from), F.L[(size_t) mv.il].blob,
+                                     cudaMemcpyDeviceToDevice, F.cs), "glm lend move", err))
+            return false;
     }
     flush();
     if (!ok) return false;
@@ -414,8 +458,10 @@ PartLend part_lendable(Glm5Model& m) {
     return p;
 }
 
-// n blocks of part m out of the pool (see the order at the top); `blocks` the ones taken
-bool lend_part(Glm5Model& m, int n, std::vector<int>& blocks, glmfast::LendCounts& c, std::string& err) {
+// n blocks of part m out of the pool (see the order at the top), at most park_max bytes of experts copied to RAM;
+// `blocks` the ones taken
+bool lend_part(Glm5Model& m, int n, size_t park_max, std::vector<int>& blocks, glmfast::LendCounts& c,
+               std::string& err) {
     FastState* F = m.fast_;
     const Glm5Geometry& g = m.geometry();
     cudaSetDevice(m.dev_);
@@ -437,7 +483,7 @@ bool lend_part(Glm5Model& m, int n, std::vector<int>& blocks, glmfast::LendCount
               " blocks, not " + std::to_string(n);
         return false;
     }
-    return glmfast::lend_take(*F, m.l0_, m.lt_, g.n_expert, blocks, c, err) &&
+    return glmfast::lend_take(*F, m.l0_, m.lt_, g.n_expert, blocks, c, err, park_max) &&
            glmfast::lend_unmap(*F, m.dev_, blocks, err);
 }
 
@@ -483,13 +529,15 @@ public:
         }
         Lease L;
         L.dev = dev;
+        size_t park_left = glmfast::lend_park_budget();   // (the card's: its parts share it)
         for (size_t j = 0; j < n.size(); ++j) {
             if (n[j] == 0) continue;
             Glm5Model* m = k->parts[j];
             std::vector<int> blocks;
             glmfast::LendCounts c;
             std::string err;
-            if (!lend_part(*m, n[j], blocks, c, err)) {
+            const auto t0 = std::chrono::steady_clock::now();
+            if (!lend_part(*m, n[j], park_left, blocks, c, err)) {
                 std::fprintf(stderr, "glm lend: CUDA%d the lend of %zu MiB failed: %s\n", dev, (size_t) want * bmib,
                              err.c_str());
                 // the parts that lent already take theirs back (nothing uses those blocks yet)
@@ -501,10 +549,13 @@ public:
                 r.max_mib = now;
                 return r;
             }
-            std::fprintf(stderr, "glm lend: CUDA%d layers [%d,%d) %zu MiB lent (%zu blocks, %d slots; %llu experts "
-                                 "moved to colder slots, %llu to the RAM tier, %llu dropped)\n",
-                         dev, m->l0_, m->l1_, blocks.size() * bmib, blocks.size(), c.slots,
-                         (unsigned long long) c.moved, (unsigned long long) c.parked, (unsigned long long) c.dropped);
+            park_left -= c.park_bytes;
+            std::fprintf(stderr, "glm lend: CUDA%d layers [%d,%d) %zu MiB lent in %.0f ms (%zu blocks, %d slots; %llu "
+                                 "experts moved to colder slots, %llu to the RAM tier (%zu MiB), %llu to disk)\n",
+                         dev, m->l0_, m->l1_, blocks.size() * bmib,
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                         blocks.size(), c.slots, (unsigned long long) c.moved, (unsigned long long) c.parked,
+                         c.park_bytes >> 20, (unsigned long long) c.dropped);
             L.sets.push_back({m, std::move(blocks)});
         }
         cudaSetDevice(prev);
