@@ -387,6 +387,21 @@ target_link_libraries(maya_plan INTERFACE maya_warnings)
 add_executable(strata-plan src/plan/plan_main.cpp)
 target_link_libraries(strata-plan PRIVATE maya_plan)
 
+# ---- maya_lend ----------------------------------------------------------
+# Lending a card's expert-cache memory out on request: the control-line commands (LEND, RETURN, LENDABLE), the lease
+# table and the lendable rule.  Shared by both engines - each implements the VramLender interface over its own cache -
+# and plain C++, so it builds (and its test runs) without a GPU toolkit.
+add_library(maya_lend STATIC src/core/vram_lend.cpp)
+target_include_directories(maya_lend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(maya_lend PRIVATE maya_warnings)
+if(MAYA_BUILD_TESTS)
+  enable_testing()
+  add_executable(vram_lend_test tests/vram_lend_test.cpp)
+  target_link_libraries(vram_lend_test PRIVATE maya_lend maya_warnings)
+  add_test(NAME vram_lend_test COMMAND vram_lend_test)
+  set_tests_properties(vram_lend_test PROPERTIES TIMEOUT 60)
+endif()
+
 # ---- maya_core (GPU runtime) ---------------------------------------------
 # Only built when a GPU backend is on, so the Phase 1 targets keep working without a toolkit.
 if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
@@ -634,7 +649,8 @@ if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
     src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_mtp.cu src/core/glm_mtp_rows.cu src/core/glm_ablate.cu
     src/core/glm_tp.cu)
   target_include_directories(maya_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  target_link_libraries(maya_engine PUBLIC maya_core maya_kernels maya_kernels_cpu ${_maya_gpu_runtime_target})
+  target_link_libraries(maya_engine PUBLIC maya_core maya_kernels maya_kernels_cpu maya_lend
+                        ${_maya_gpu_runtime_target})
   if(WIN32 AND MAYA_ENABLE_CUDA)
     target_link_libraries(maya_engine PRIVATE dxgi)
   endif()
@@ -756,7 +772,7 @@ if(MAYA_ENABLE_CUDA OR MAYA_ENABLE_HIP)
       VERBATIM)
     add_dependencies(maya-ds4 maya_build_id)
     target_include_directories(maya-ds4 PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
-    target_link_libraries(maya-ds4 PRIVATE maya_kernels maya_kernels_cpu maya_spec ${_maya_gpu_runtime_target}
+    target_link_libraries(maya-ds4 PRIVATE maya_kernels maya_kernels_cpu maya_spec maya_lend ${_maya_gpu_runtime_target}
                           ${_maya_gpu_blas_target})
     if(MAYA_ENABLE_HIP AND MAYA_HIPBLASLT_AVAILABLE)   # (the prompt path's dense GEMMs: ds4_lt.cu)
       set_source_files_properties(src/ds4/ds4_lt.cu PROPERTIES COMPILE_DEFINITIONS MAYA_HIPBLASLT_AVAILABLE=1)
