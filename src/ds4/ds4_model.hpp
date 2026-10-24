@@ -38,14 +38,15 @@ namespace strata::ds4 {
 /// back; their slots come back empty, and the cache fills them with the experts the decode misses.
 namespace lend {
 
-/// The slots a layer keeps on a card beyond its swap spare and its recent slots, which a lend never takes: the
-/// engine's own floor - a cached layer runs on one VRAM slot and the spare (place_experts: a cache needs two slots, the
-/// prompt path's tail leaves a layer one).
-constexpr int kKeep = 1;
+/// The slots a layer keeps on a card beyond its recent slots, which a lend never takes: the engine's own floor - a
+/// cached layer runs on one VRAM slot and the swap spare (place_experts: a cache needs two slots, the prompt path's
+/// tail leaves a layer one).  The spare is a role, not a place: every swap moves it to the slot it empties, so it
+/// counts as one of these wherever it is, and a lend that takes its slot moves it first (spare_slot).
+constexpr int kKeep = 2;
 
-/// A slot of a pool block: its region (a layer's member on the card), whether a lend must leave it (the cache's swap
-/// spare, a recent slot), whether it can hold an expert now (false: a lend on another card has its block), and the
-/// heat of the expert in it (0: empty).
+/// A slot of a pool block: its region (a layer's member on the card), whether a lend must leave it (a recent slot:
+/// those stay where they are), whether it can hold an expert now (false: a lend on another card has its block), and
+/// the heat of the expert in it (0: empty).
 struct Slot {
     int region = 0;
     bool fixed = false, live = true;
@@ -58,10 +59,11 @@ struct Block {
 };
 
 /// The blocks a lend may take: mapped, not foreign, no fixed slot, and not among those that keep each region `keep`
-/// live slots (beyond the fixed ones, counted as slots, an expert in them or not): a region short of them keeps the
-/// blocks that hold the most regions still short, then the most of its own slots, then the lowest index.  So they
-/// follow the layout and the blocks lent, never the heat: a return (its slots empty) or a warmer cache leaves the
-/// count as it was, and a lend of every candidate succeeds.  In block order.
+/// live slots (beyond the fixed ones, counted as slots, an expert in them or not, the swap spare one of them): a region
+/// short of them keeps the blocks that hold the most regions still short, then the most of its own slots, then the
+/// lowest index.  So they follow the layout and the blocks lent, never the heat or where the spare is: a return (its
+/// slots empty), a warmer cache or a swap (the spare in another slot) leaves the count as it was, and a lend of every
+/// candidate succeeds.  In block order.
 std::vector<int> candidates(const std::vector<Block>& blocks, int n_regions, int keep);
 /// The lendable rule's inputs over a card's blocks, and its answer (core::lendable_bytes): the pool is the mapped
 /// blocks of the layers that lend, the minimum the blocks of them a lend must leave (`n_cand` of them it may take).
@@ -81,6 +83,11 @@ std::vector<int> pick(const std::vector<Block>& blocks, const std::vector<int>& 
 void slots_out(std::vector<int>& slot, std::vector<int>& out, std::vector<int>& free, int first, int count,
                std::vector<int>& dropped);
 void slots_back(std::vector<int>& out, std::vector<int>& free, int first, int count);
+/// Where a layer's swap spare goes when a lend takes its slot: of the slots `ok` names (the ones the lend leaves the
+/// layer, live, not a recent one, not the spare's), one with no expert in `slot` (expert -> slot), else the one of the
+/// coldest expert - `expert` (-1: none), which the caller drops to the CPU lane as one a lend drops.  -1: none of them.
+/// A region keeps kKeep live slots, so a lend of candidates leaves it at least one.
+int spare_slot(const std::vector<int>& slot, const std::vector<float>& heat, const std::vector<char>& ok, int& expert);
 
 /// What the lender needs of the engine, from the thread that runs the windows and between them.
 class Site {
@@ -90,8 +97,9 @@ public:
     virtual core::VramPool* pool(int dev) = 0;            // that card's pool (null: none)
     virtual void quiesce() = 0;                           // the cache's moves under way landed, none started
     virtual void view(int dev, std::vector<Block>& blocks, int& n_regions) = 0;
-    /// The blocks' slots out of the slot tables (their experts to the CPU lane), the tables on the devices, and the
-    /// card synchronized: nothing runs on the blocks any more.  False and err: refused, nothing changed.
+    /// The blocks' slots out of the slot tables (their experts to the CPU lane), a swap spare in them moved to a slot
+    /// they leave (spare_slot), the tables on the devices, and the card synchronized: nothing runs on the blocks any
+    /// more.  False and err: refused, nothing changed.
     virtual bool take(int dev, const std::vector<int>& blocks, std::string& err) = 0;
     virtual void put(int dev, const std::vector<int>& blocks) = 0;   // the blocks' slots back (mapped again), empty
 };
