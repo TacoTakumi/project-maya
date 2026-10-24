@@ -371,8 +371,8 @@ for line in sys.stdin:
         self.dir.cleanup()
 
     def wire(self, mib=None):
-        from serve.server import wire_vision_lend
-        wire_vision_lend(self.vision, self.svc, mib or self.MIB)
+        from serve.server import wire_vision_lease
+        wire_vision_lease(self.vision, self.svc, mib or self.MIB)
 
     def state(self):
         with urllib.request.urlopen(self.base + "/vram/state", timeout=30) as r:

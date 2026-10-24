@@ -1647,7 +1647,7 @@ class Vision:
     are cached by the source's hash, so a conversation that sends the same picture again (every turn, with most
     clients) encodes it once.
 
-    On demand (start=False, `lend`/`reclaim` set by wire_vision_lend): no process until a picture needs encoding;
+    On demand (start=False, `lend`/`reclaim` set by wire_vision_lease): no process until a picture needs encoding;
     the engine first lends the encoder's size of its expert cache on the first GPU (a lease, as POST /vram/lend
     takes one: /vram/state lists it), the encoder starts in that memory, and once the request's pictures are encoded
     (`active()`) it ends and the lease goes back.  The decode keeps the whole cache between pictures (~18% faster on
@@ -1888,7 +1888,7 @@ def first_card(engine) -> str | None:
                 None)
 
 
-def wire_vision_lend(vision: Vision, svc, mib: int):
+def wire_vision_lease(vision: Vision, svc, mib: int):
     """The on-demand encoder borrows `mib` MiB on the engine's first GPU through the service's /vram leases (so
     /vram/state lists it while the encoder runs) and gives the lease back when it ends.  A lend the engine refuses
     (the card cannot lend that much now, or the engine cannot lend or did not answer) does not start the encoder: the
@@ -6104,7 +6104,7 @@ def main() -> int:
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     if on_demand_vision is not None:                    # its lease goes through the /vram routes' record
-        wire_vision_lend(on_demand_vision, svc, vision_mib)
+        wire_vision_lease(on_demand_vision, svc, vision_mib)
     if getattr(engine, "multi", 0) > 1:                 # n conversations at once: n places in the FIFO
         svc.fifo.set_capacity(engine.multi)
         print(f"[maya] {engine.multi} conversations at once (--parallel)", flush=True)
