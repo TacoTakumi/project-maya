@@ -1,31 +1,32 @@
-"""The /vram routes: another program on the machine borrows part of a card's expert-cache memory from the engine and
+"""The /vram routes: another program on the machine borrows part of a GPU's expert-cache memory from the engine and
 gives it back.  The engine owns the leases (its LEND / RETURN / LENDABLE control lines, include/strata/core/
 vram_lend.hpp); this module turns the HTTP calls into those lines and their answers into JSON:
 
-    POST /vram/lend {"card": "0000:0a:00.0", "mib": 2048}
-        200 {"id": "7", "card": "0000:0a:00.0", "mib": 2048}   mib: what the engine lent (rounded up to its blocks)
-        400 {"error": ...}           mib missing, not a whole number (a bool is not one), 0 or negative; a card that is
-                                     not a PCI address or not one the engine uses; a body that is not a JSON object
-        409 {"max_mib": N}           more than the card can lend now (N: its lendable; 0 for a card that does not lend)
+    POST /vram/lend {"gpu": "0000:0a:00.0", "mib": 2048}
+        200 {"id": "7", "gpu": "0000:0a:00.0", "mib": 2048}   mib: what the engine lent (rounded up to its blocks)
+        400 {"error": ...}           mib missing, not a whole number (a bool is not one), 0 or negative; a gpu that is
+                                     not a PCI address or not one the engine uses (or a body that names it card, not
+                                     gpu); a body that is not a JSON object
+        409 {"max_mib": N}           more than the GPU can lend now (N: its lendable; 0 for a GPU that does not lend)
     POST /vram/return {"id": "7"}    (a number is taken too)
-        200 {"id": "7", "card": "0000:0a:00.0", "mib": 2048}
+        200 {"id": "7", "gpu": "0000:0a:00.0", "mib": 2048}
         400 {"error": ...}           no id, or one that is not a word
         404 {"error": ...}           the server handed out no open lease with that id (never lent, returned already,
                                      or the engine ended): nothing goes to the engine
         409 {"error": ..., "retry": true}   the memory is still in use: the lease stays open, try again later
     GET /vram/state
-        200 {"cards": [{"card", "lendable", "lent"}, ...], "leases": [{"id", "card", "mib"}, ...]}
+        200 {"gpus": [{"gpu", "lendable", "lent"}, ...], "leases": [{"id", "gpu", "mib"}, ...]}
 
 Every lend and return route answers 501 {"error": ...} for an engine without lending (it refuses the commands, or it
 is not a Maya engine), and 503 {"error": ...} when the engine is not running or did not answer; /vram/state then lists
-the engine's cards with lendable and lent 0 (no cards at all for an engine that reports none).  The engine takes the
+the engine's GPUs with lendable and lent 0 (no GPUs at all for an engine that reports none).  The engine takes the
 commands between its steps, and one step can read a long prompt: a LEND it answers after the route stopped waiting
 (Lender.answer_s, 30 s) still lends, and the server gives that lease back by itself - /vram/state lists it until the
 engine has it back.
 
-A card is named by its PCI address, matched whatever its case or spelling (gpu_map.pci_addr: CUDA's, NVML's 8-digit
+A GPU is named by its PCI address, matched whatever its case or spelling (gpu_map.pci_addr: CUDA's, NVML's 8-digit
 domain, lspci's without one) and answered as "0000:0a:00.0" - lower case, a 4-digit domain and the function, as lspci
-and sysfs spell it.  The engine's VRAM lines give each card's number.  A lease id is opaque (a string; the engines hand
+and sysfs spell it.  The engine's VRAM lines give each GPU's number.  A lease id is opaque (a string; the engines hand
 out decimal numbers, from 1 again in each process: the server adds what earlier processes handed out, so an id names one
 lease for the server's life).
 
@@ -156,7 +157,7 @@ class Lender:
     def __init__(self):
         self._lock = threading.Lock()     # the record: held to read or change it, never while the engine answers
         self._owner = None                # the engine process the record belongs to
-        self._leases: dict[str, dict] = {}   # id -> {"id", "card", "mib"}, in the order they were lent
+        self._leases: dict[str, dict] = {}   # id -> {"id", "gpu", "mib"}, in the order they were lent
         self._engine_id: dict[str, str] = {}  # id -> the engine's id for that lease
         self._owed: dict[str, bool] = {}  # the leases the server gives back itself -> their RETURN is out now
         self._base = 0                    # added to the engine's ids: past every id an earlier engine process had
@@ -201,7 +202,7 @@ class Lender:
             n = self._base + int(eid)
             self._top = max(self._top, n)
             lid = str(n)
-        lease = {"id": lid, "card": addr, "mib": mib}
+        lease = {"id": lid, "gpu": addr, "mib": mib}
         self._leases[lid], self._engine_id[lid] = lease, eid
         return lease
 
@@ -244,8 +245,8 @@ class Lender:
             box["leases"] = [dict(x) for x in self._leases.values()] if self._owner is owner else []
 
     @staticmethod
-    def _cards(engine) -> list[tuple[int, str]]:
-        """(engine card number, PCI address) of each card the engine's VRAM lines name, in its order, each once."""
+    def _gpus(engine) -> list[tuple[int, str]]:
+        """(engine GPU number, PCI address) of each GPU the engine's VRAM lines name, in its order, each once."""
         out: list[tuple[int, str]] = []
         for r in getattr(engine, "vram", None) or []:
             addr = r.get("addr")
@@ -284,18 +285,20 @@ class Lender:
     # -- the routes
     def lend(self, engine, req) -> tuple[int, dict]:
         if not isinstance(req, dict):
-            return 400, {"error": "the request body must be a JSON object {\"card\": ..., \"mib\": ...}"}
+            return 400, {"error": "the request body must be a JSON object {\"gpu\": ..., \"mib\": ...}"}
         mib = req.get("mib")
         if not isinstance(mib, int) or isinstance(mib, bool) or mib <= 0:
             return 400, {"error": "mib must be a whole number of MiB above 0"}
-        addr = gpu_map.pci_addr(req.get("card"))
+        if "gpu" not in req and "card" in req:        # (the field's name before it was gpu)
+            return 400, {"error": "the GPU's field is \"gpu\", not \"card\": {\"gpu\": \"0000:0a:00.0\", \"mib\": ...}"}
+        addr = gpu_map.pci_addr(req.get("gpu"))
         if addr is None:
-            return 400, {"error": "card must be a GPU's PCI address, like 0000:0a:00.0"}
+            return 400, {"error": "\"gpu\" must be a GPU's PCI address, like 0000:0a:00.0"}
         if not hasattr(engine, "lend_command"):
             return self._unsupported()
-        dev = next((d for d, a in self._cards(engine) if a == addr), None)
+        dev = next((d for d, a in self._gpus(engine) if a == addr), None)
         if dev is None:
-            return 400, {"error": f"card {addr} is not one the model uses"}
+            return 400, {"error": f"GPU {addr} is not one the model uses"}
         running, owner = self._begin(engine)
         if not running:
             return 503, {"error": "the model is not loaded"}
@@ -317,7 +320,7 @@ class Lender:
             return 200, dict(lease)
         if f[:2] == ["ERR", "MAX"] and f[2].isdigit():
             return 409, {"max_mib": int(f[2])}
-        if f[:2] == ["ERR", "NODEV"]:                 # a card of the model's that does not lend: it can give 0
+        if f[:2] == ["ERR", "NODEV"]:                 # a GPU of the model's that does not lend: it can give 0
             return 409, {"max_mib": 0}
         if f[:2] == ["ERR", "MALFORMED"]:             # (a mib too large for the engine)
             return 400, {"error": f"the engine refused the lend: {got[0]}"}
@@ -362,8 +365,8 @@ class Lender:
         return 502, {"error": f"the engine answered {got[0]!r}"}
 
     def state(self, engine) -> tuple[int, dict]:
-        cards = self._cards(engine)
-        idle = {"cards": [{"card": a, "lendable": 0, "lent": 0} for _, a in cards], "leases": []}
+        gpus = self._gpus(engine)
+        idle = {"gpus": [{"gpu": a, "lendable": 0, "lent": 0} for _, a in gpus], "leases": []}
         if not hasattr(engine, "lend_command"):
             return 200, idle
         running, owner = self._begin(engine)
@@ -379,8 +382,8 @@ class Lender:
             f = dict(kv.partition("=")[::2] for kv in line.split()[1:]) if line.startswith("LENDABLE ") else {}
             if all(f.get(k, "").isdigit() for k in ("dev", "lendable", "lent")):
                 figures[int(f["dev"])] = (int(f["lendable"]), int(f["lent"]))
-        name = dict(cards)
-        out = [{"card": name[d], "lendable": figures[d][0], "lent": figures[d][1]} for d in figures if d in name]
-        # the model's other cards (no lending there): listed, with nothing to give
-        out += [{"card": a, "lendable": 0, "lent": 0} for d, a in cards if d not in figures]
-        return 200, {"cards": out, "leases": box.get("leases", [])}
+        name = dict(gpus)
+        out = [{"gpu": name[d], "lendable": figures[d][0], "lent": figures[d][1]} for d in figures if d in name]
+        # the model's other GPUs (no lending there): listed, with nothing to give
+        out += [{"gpu": a, "lendable": 0, "lent": 0} for d, a in gpus if d not in figures]
+        return 200, {"gpus": out, "leases": box.get("leases", [])}
