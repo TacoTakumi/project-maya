@@ -27,13 +27,16 @@ ROOT = Path(__file__).resolve().parents[1]
 # thread: the command loop reads on meanwhile), STOP, QUIT and the lend commands with the engines' answers.  Cards lend
 # in 64 MiB blocks (a lend is rounded up).  FAKE_LEND=0: an engine without lending (the "unsupported command" ERR);
 # FAKE_MULTI=<n>: several conversations (READY ... multi=<n>, the lines tagged with rid); FAKE_BUSY=<n>: the first n
-# RETURNs answer ERR BUSY; FAKE_LOG: every line it reads, one a line.
+# RETURNs answer ERR BUSY; FAKE_SLOW=<n>: the first n LENDs are answered 1.2 s late (the command loop waits, as an
+# engine's does while it reads a long prompt: the commands behind them wait too); FAKE_LOG: every line it reads, one a
+# line.
 STAND_IN = r'''
 import os, re, sys, threading, time
 
 lend_on = os.environ.get("FAKE_LEND", "1") == "1"
 multi = int(os.environ.get("FAKE_MULTI", "0") or 0)
 busy = [int(os.environ.get("FAKE_BUSY", "0") or 0)]
+slow = [int(os.environ.get("FAKE_SLOW", "0") or 0)]
 log = os.environ.get("FAKE_LOG")
 pool = {0: 4096, 1: 2048}                            # dev -> what it can lend with nothing out (MiB)
 block = 64
@@ -117,6 +120,9 @@ for line in sys.stdin:
         if not lend_on:
             out(f"ERR unsupported command '{f[0]}' (GEN, GENI, STOP and QUIT)")
             continue
+        if f[0] == "LEND" and slow[0] > 0:
+            slow[0] -= 1
+            time.sleep(1.2)
         for a in lend_cmd(f):
             out(a)
         continue
@@ -281,6 +287,34 @@ class Routes(LendBase):
         self.assertEqual(code, 404, out)
         self.assertIn("error", out)
 
+    def test_an_id_the_server_did_not_hand_out_is_404_and_not_sent(self):
+        # a lease the engine has and the server never recorded: the server does not return it
+        self.assertEqual(self.engine.lend_command("LEND 0 64"), ["LENT 7 0 64"])
+        code, out = self.give_back("7")
+        self.assertEqual(code, 404, out)
+        self.assertEqual(self.give_back("999")[0], 404)
+        self.assertEqual(self.engine_lines("RETURN"), [])
+        self.assertEqual(self.card(self.state(), "0000:01:00.0")["lent"], 64)
+
+    def test_an_id_from_before_a_restart_is_404(self):
+        # the new process hands out the engine's ids from the start again: an old id never names its lease
+        code, a = self.lend("0000:01:00.0", 64)
+        self.assertEqual(code, 200, a)
+        self.engine.restart()
+        code, b = self.lend("0000:01:00.0", 128)
+        self.assertEqual(code, 200, b)
+        self.assertEqual(self.engine_lines("LENT"), [])
+        self.assertNotEqual(b["id"], a["id"])
+        code, out = self.give_back(a["id"])
+        self.assertEqual(code, 404, out)
+        self.assertEqual(self.engine_lines("RETURN"), [])
+        st = self.state()
+        self.assertEqual(st["leases"], [{"id": b["id"], "card": "0000:01:00.0", "mib": 128}])
+        self.assertEqual(self.card(st, "0000:01:00.0")["lent"], 128)
+        self.assertEqual(self.give_back(b["id"])[0], 200)
+        self.assertEqual(self.engine_lines("RETURN"), ["RETURN 7"])   # (the new process's own id for it)
+        self.assertEqual(self.state()["leases"], [])
+
     def test_bad_id_is_400(self):
         for i in (None, True, 1.5, "", "1 2", "1\nLEND 0 64", ["1"]):
             code, out = self.give_back(i)
@@ -330,6 +364,65 @@ class Busy(LendBase):
         code, out = self.give_back(a["id"])
         self.assertEqual(code, 200, out)
         self.assertEqual(self.state()["leases"], [])
+
+
+class LateAnswers(LendBase):
+    """A LEND the engine answers after the server stopped waiting (an engine takes the lend commands between its
+    steps, and one step can read a long prompt): the answer is that LEND's, never the next command's, and its lease
+    goes back to the engine."""
+    env = {"FAKE_SLOW": "1"}
+
+    def setUp(self):
+        super().setUp()
+        self.svc.vram_lend.answer_s = 0.5
+
+    def given_back(self):
+        """/vram/state once the late lease is back (the engine read RETURN and nothing is listed any more)."""
+        end = time.monotonic() + 10
+        while time.monotonic() < end:
+            if self.engine_lines("RETURN"):
+                st = self.state()
+                if not st["leases"]:
+                    return st
+            time.sleep(0.05)
+        self.fail(f"the late lease did not go back: {self.engine_lines('RETURN')}, {self.state()}")
+
+    def test_late_lend_is_given_back(self):
+        code, out = self.lend("0000:01:00.0", 64)
+        self.assertEqual(code, 503, out)
+        self.assertIn("give it back", out["error"])
+        st = self.given_back()
+        self.assertEqual(self.engine_lines("RETURN"), ["RETURN 7"])
+        self.assertEqual([c["lent"] for c in st["cards"]], [0, 0, 0])
+        self.assertEqual(self.card(st, "0000:01:00.0")["lendable"], 4096)
+
+    def test_retry_after_a_late_lend_holds_one_lease(self):
+        self.assertEqual(self.lend("0000:01:00.0", 64)[0], 503)
+        self.svc.vram_lend.answer_s = 10
+        code, b = self.lend("0000:01:00.0", 128)
+        self.assertEqual(code, 200, b)
+        self.assertEqual((b["card"], b["mib"]), ("0000:01:00.0", 128))
+        self.assertNotEqual(b["id"], "7")
+        end = time.monotonic() + 10
+        while time.monotonic() < end:
+            st = self.state()
+            if self.engine_lines("RETURN") and len(st["leases"]) == 1:
+                break
+            time.sleep(0.05)
+        self.assertEqual(self.engine_lines("RETURN"), ["RETURN 7"])       # the late one, not the retry's
+        self.assertEqual(st["leases"], [b])
+        self.assertEqual(self.card(st, "0000:01:00.0")["lent"], 128)
+
+    def test_state_after_a_late_lend_reads_the_engine(self):
+        self.assertEqual(self.lend("0000:01:00.0", 64)[0], 503)
+        self.svc.vram_lend.answer_s = 10
+        st = self.state()
+        self.assertEqual(self.card(st, "0000:0a:00.0"), {"card": "0000:0a:00.0", "lendable": 2048, "lent": 0})
+        first = self.card(st, "0000:01:00.0")
+        self.assertEqual(first["lendable"] + first["lent"], 4096)
+        self.assertEqual(sum(x["mib"] for x in st["leases"]), first["lent"])   # listed while the engine lends it
+        st = self.given_back()
+        self.assertEqual(self.card(st, "0000:01:00.0"), {"card": "0000:01:00.0", "lendable": 4096, "lent": 0})
 
 
 class WhileRequestsRun(LendBase):

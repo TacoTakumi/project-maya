@@ -463,6 +463,29 @@ class OnDemandVisionBusyReturn(OnDemandVisionBase):
         self.assertFalse(self.vision.owed)
 
 
+class OnDemandVisionRestart(OnDemandVisionBase):
+    """The engine restarted while the encoder's lease was owed: that lease ended with the old process, and the new
+    process's lease with the same engine id (another borrower's) is not the encoder's to give back."""
+
+    def test_owed_lease_from_before_a_restart_has_ended(self):
+        self.wire()
+        self.vision.lease = self.vision.lend()            # (an encode whose return kept failing: the lease is owed)
+        self.assertTrue(self.vision.owed)
+        self.engine.restart()
+        code, other = self.svc.vram_lend.lend(self.engine, {"card": "0000:01:00.0", "mib": 64})
+        self.assertEqual(code, 200, other)
+        self.assertTrue(self.vision.settle())
+        self.assertFalse(self.vision.owed)
+        self.assertEqual([x for x in self.engine_lines() if x.startswith("RETURN ")], [])
+        st = self.state()
+        self.assertEqual(st["leases"], [other])
+        self.assertEqual(next(c for c in st["cards"] if c["card"] == "0000:01:00.0")["lent"], 64)
+        self.go.write_text("go")                          # the next picture borrows and gives back its own lease
+        self.prepare()
+        self.assertEqual(self.state()["leases"], [other])
+        self.assertEqual(len([x for x in self.engine_lines() if x.startswith("RETURN ")]), 1)
+
+
 class GlmThinkingLevels(unittest.TestCase):
     """GLM-5.x's template knows reasoning_effort low / high and is "Max" otherwise (no effort given included), and it
     always opens <think>: the server's levels map onto low / high / max, and thinking off closes the think block."""
