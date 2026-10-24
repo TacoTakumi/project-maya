@@ -1412,6 +1412,8 @@ bool Glm5Model::fast_setup(std::string& err) {
             }
         }
         size_t room_u = 0;   // a unified-memory host: what its RAM leaves for a pool, before the experts' cap
+        // the pool holds whole slots in blocks (pool_fit): the budget below counts slot bytes, what fits in its bytes
+        const auto fit = pool_fit();
 #if !defined(_WIN32)
         if (F->unified_memory) {
             // Measure after dense/KV/scratch and pinned prompt staging are allocated.  The runtime's free figure counts
@@ -1438,8 +1440,10 @@ bool Glm5Model::fast_setup(std::string& err) {
                 room_u = glmfast::expert_pool_budget(true, free_b, (size_t) avail_kb * 1024, reserve,
                                                      (size_t) (head_gb * 1073741824.0), ~size_t{0});
                 if (pf_ != nullptr) room_u -= std::min(room_u, mmq_scratch_reserve());
+                // (every expert's slot as the pool lays it out, so the share below leaves room for all of them)
                 avail = glmfast::expert_pool_budget(true, free_b, (size_t) avail_kb * 1024, reserve,
-                                                    (size_t) (head_gb * 1073741824.0), expert_bytes);
+                                                    (size_t) (head_gb * 1073741824.0),
+                                                    (size_t) ((double) expert_bytes / fit.first) + fit.second);
                 std::fprintf(stderr, "glm fast: CUDA%d unified memory: MemAvailable %.2f GB, headroom %.2f GB + "
                                      "%zu MB reserve, experts need %.2f GB, pool budget %.2f GB\n", dev_,
                              (double) avail_kb / 1048576.0, head_gb, reserve >> 20,
@@ -1462,6 +1466,8 @@ bool Glm5Model::fast_setup(std::string& err) {
             avail = std::min(avail, room);
             room_u = std::min(room_u, room);
         }
+        avail = avail > fit.second ? (size_t) ((double) (avail - fit.second) * fit.first) : 0;
+        room_u = room_u > fit.second ? (size_t) ((double) (room_u - fit.second) * fit.first) : 0;
         if (pool_b_.fixed > 0) avail = std::min(avail, (size_t) pool_b_.fixed * stride_max);   // (an APU's too)
         if (pool_b_.fixed > 0) room_u = std::min(room_u, (size_t) pool_b_.fixed * stride_max);
         // every layer gets the same number of slots: avail / sum(blob over layers)
@@ -1743,83 +1749,89 @@ bool Glm5Model::fast_setup(std::string& err) {
                 }
             }
         }
-        size_t tot = 0, xtot = 0;
-        int nmin = INT32_MAX, nmax = 0;
-        for (int il = l0_; il < lt_; ++il)
-            if (F->L[(size_t) il].moe) {
-                tot += (size_t) nsl[(size_t) il] * slot_stride(il);
-                xtot += (size_t) k_extra * slot_stride(il);
-                nmin = std::min(nmin, nsl[(size_t) il]);
-                nmax = std::max(nmax, nsl[(size_t) il]);
-            }
-        // the main slots in one allocation - or, where the driver caps a single allocation below them (Windows gives
-        // a 160 GiB APU carve-out in blocks of at most ~96 GiB), in several, each holding whole layers: a layer's
-        // slots are addressed from its own base (P.base), never across layers
-        std::vector<uint8_t*> segs;
-        std::vector<int> seg_of((size_t) NL, 0);
-        const size_t main_bytes = tot - xtot;
-        if (no_pool) {
-            segs.push_back(nullptr);   // (no slots: nothing to allocate - P.base stays null and P.n 0 in every layer)
-        } else if (uint8_t* one = nullptr; glmd::mmq_malloc((void**) &one, main_bytes) == 0) {   // glm-dsa B15.2: zeroed, 512-B tail
-            segs.push_back(one);
-        } else {
-            cudaGetLastError();
-            size_t layer_max = 0;
-            for (int il = l0_; il < lt_; ++il)
-                if (F->L[(size_t) il].moe)
-                    layer_max = std::max(layer_max, (size_t) (nsl[(size_t) il] - k_extra) * slot_stride(il));
-            for (size_t cap = main_bytes / 2; segs.empty() && cap >= layer_max && layer_max > 0; cap /= 2) {
-                std::vector<size_t> sizes(1, 0);
-                for (int il = l0_; il < lt_; ++il) {
-                    if (!F->L[(size_t) il].moe) continue;
-                    const size_t lb = (size_t) (nsl[(size_t) il] - k_extra) * slot_stride(il);
-                    if (sizes.back() > 0 && sizes.back() + lb > cap) sizes.push_back(0);
-                    sizes.back() += lb;
-                    seg_of[(size_t) il] = (int) sizes.size() - 1;
-                }
-                for (size_t sz : sizes) {
-                    uint8_t* p = nullptr;
-                    if (glmd::mmq_malloc((void**) &p, sz) != 0) {   // glm-dsa B15.2
-                        cudaGetLastError();
-                        for (uint8_t* q : segs) cudaFree(q);
-                        segs.clear();
-                        break;
-                    }
-                    segs.push_back(p);
-                }
-            }
-            if (!segs.empty())
-                std::fprintf(stderr, "glm fast: CUDA%d one allocation of %.2f GB did not allocate: the expert pool is in "
-                                     "%zu\n", dev_, (double) main_bytes / 1073741824.0, segs.size());
-        }
-        if (segs.empty() || (xtot > 0 && glmd::mmq_malloc((void**) &F->xpool, xtot) != 0)) {   // glm-dsa B15.2
-            for (uint8_t* q : segs) cudaFree(q);
-            err = "glm fast: the expert pool (" + std::to_string(tot >> 20) + " MB) did not allocate";
+        // the main slots: the expert pool (strata::core::VramPool) - one address range on this card, backed by blocks
+        // of whole slots that the driver can take back and map again at the same addresses (or, without that, one
+        // plain allocation of the same layout, or one a layer where the driver caps a single allocation below it).
+        // A region a layer, the layers ordered by slot size: a new size starts a new block, so grouped, each size
+        // leaves at most one block part empty.  A layer's slots are back to back only within a block (LayerPool).
+        // Should it not allocate, every layer's main slots shrink by a sixteenth and it is tried again (twice at most),
+        // never below a route's experts and the spares.
+        if (glmd::mmq_pad_on()) {   // vram-lend: the VMM pool has no B15.2 tail pad or zeroing (glm-dsa only)
+            err = "glm fast: GLM-5.3 (744B, glm-dsa) needs the MMQ tail pad (B15.2), which the VMM expert pool of "
+                  "this vram-lend build does not lay out - use upstream Maya for this model";
             return false;
         }
-        F->pool = segs[0];
-        F->pool_more.assign(segs.begin() + 1, segs.end());
+        if (no_pool) {   // vram-lend: upstream v1.1.67's start without an expert pool (one small card) has no VMM pool form
+            err = "glm fast: CUDA" + std::to_string(dev_) + " has no room for an expert pool, and the start without one "
+                  "(upstream v1.1.67) is not in this vram-lend build - use upstream Maya on this card";
+            return false;
+        }
+        std::vector<int> order;
+        for (int il = l0_; il < lt_; ++il)
+            if (F->L[(size_t) il].moe) order.push_back(il);
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return slot_stride(a) < slot_stride(b); });
+        {
+            strata::core::VramPool::Options po;
+            po.tag = "glm fast";
+            for (int attempt = 0;; ++attempt) {
+                std::vector<strata::core::VramPoolRegion> regions;
+                for (int il : order) regions.push_back({slot_stride(il), nsl[(size_t) il] - k_extra});
+                std::string perr;
+                if (order.empty() || F->vpool.create(dev_, regions, po, perr)) break;
+                bool shrunk = false;
+                for (int il : order) {
+                    int& nl = nsl[(size_t) il];
+                    const int m = std::max(g.n_exp_used + gf::kSpares + k_extra, nl - std::max(1, (nl - k_extra) / 16));
+                    if (attempt < 2 && m < nl) {
+                        nl = m;
+                        shrunk = true;
+                    }
+                }
+                if (!shrunk) {
+                    err = "glm fast: the expert pool did not allocate (" + perr + ")";
+                    return false;
+                }
+                std::fprintf(stderr, "glm fast: CUDA%d %s - the main slots a sixteenth fewer\n", dev_, perr.c_str());
+            }
+        }
+        size_t xtot = 0;
+        int nmin = INT32_MAX, nmax = 0;
+        for (int il : order) {
+            xtot += (size_t) k_extra * slot_stride(il);
+            nmin = std::min(nmin, nsl[(size_t) il]);
+            nmax = std::max(nmax, nsl[(size_t) il]);
+            F->complete = F->complete && glmfast::complete_pool(nsl[(size_t) il] - k_extra, g.n_expert, gf::kSpares);
+        }
+        const size_t tot = F->vpool.bytes() + xtot;
+        if (xtot > 0 && glmd::mmq_malloc((void**) &F->xpool, xtot) != 0) {
+            cudaGetLastError();
+            F->vpool.destroy();
+            err = "glm fast: the expert pool's tail (" + std::to_string(xtot >> 20) + " MB) did not allocate";
+            return false;
+        }
         F->pool_bytes = tot;
         F->xpool_bytes = xtot;
-        uint8_t* b = F->pool;
-        int cur_seg = 0;
-        for (int il = l0_; il < lt_; ++il) {
-            if (!F->L[(size_t) il].moe) continue;
+        F->pool_layer = order;
+        for (size_t r = 0; r < order.size(); ++r) {
+            const int il = order[r];
             auto& P = F->lp[(size_t) il];
+            const auto& R = F->vpool.region((int) r);
             const int nl = nsl[(size_t) il];
-            if (seg_of[(size_t) il] != cur_seg) b = segs[(size_t) (cur_seg = seg_of[(size_t) il])];
             P.stride = slot_stride(il);
             P.n = nl;
             P.n_main = nl - k_extra;
-            P.base = b;
+            P.origin = R.origin;
+            P.block = F->vpool.block_bytes();
+            P.per_block = R.per_block;
+            P.first_pos = R.first_pos;
+            P.region = (int) r;
             P.key.assign((size_t) nl, -1);
             P.tick.assign((size_t) nl, 0);
             P.st.assign((size_t) nl, FastState::kFree);
-            b += (size_t) P.n_main * P.stride;
             F->pool_slots += nl;
         }
         uint8_t* xregion = F->xpool;
-        b = xregion;
+        uint8_t* b = xregion;
         for (int il = l0_; il < lt_; ++il) {
             if (!F->L[(size_t) il].moe) continue;
             auto& P = F->lp[(size_t) il];
@@ -4940,8 +4952,12 @@ void Glm5Model::fast_destroy() {
     if (F->mtp_dx_ids) cudaFree(F->mtp_dx_ids);
     if (F->mtp_emb_h) cudaFreeHost(F->mtp_emb_h);
     if (F->ev_mtp_emb) cudaEventDestroy(F->ev_mtp_emb);
-    if (F->pool) cudaFree(F->pool);
-    for (uint8_t* p : F->pool_more) cudaFree(p);
+    // (the pool's unmap does not wait for kernels as cudaFree does: the card is done with the slots first)
+    if (F->vpool.valid()) {
+        cudaSetDevice(dev_);
+        cudaDeviceSynchronize();
+    }
+    F->vpool.destroy();
     if (F->xpool) cudaFree(F->xpool);
     if (F->arena) cudaFree(F->arena);
     if (F->ps) cudaStreamSynchronize(F->ps);
@@ -7629,6 +7645,40 @@ Glm5Model::PoolBudget Glm5Model::part_budget(size_t free_b, size_t total_b, size
     PoolBudget b = pool_budget(free_b, total_b, part_, floor_b, slot_b, fast_ != nullptr && fast_->unified_memory);
     b.avail = b.avail > pool_short_ ? b.avail - pool_short_ : 0;
     return b;
+}
+
+// The main slots' pool (strata::core::VramPool) puts whole slots in blocks of one size: the end of a block that no
+// slot fills is unused, and so is the end of the last block of each slot size (fast_setup groups the layers by
+// size).  {share, rounding}: a pool of B bytes holds at least (B - rounding) * share bytes of slots, for the block
+// size whose worst slot size wastes least - the pool takes the size that wastes least in all, so never more.
+std::pair<double, size_t> Glm5Model::pool_fit() const {
+    const FastState* F = fast_;
+    std::vector<size_t> sizes;
+    if (F != nullptr)
+        for (int il = l0_; il < lt_; ++il) {
+            const auto& Ly = F->L[(size_t) il];
+            if (!Ly.moe) continue;
+            const size_t s = glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type);
+            if (s > 0 && std::find(sizes.begin(), sizes.end(), s) == sizes.end()) sizes.push_back(s);
+        }
+    if (sizes.empty()) return {1.0, 0};
+    size_t gran = 0;
+    strata::core::VramPool::vmm_supported(dev_, &gran);
+    const strata::core::VramPool::Options o;
+    const size_t smax = *std::max_element(sizes.begin(), sizes.end());
+    const size_t lo = std::max((smax + gran - 1) / gran, (o.min_block_bytes + gran - 1) / gran);
+    const size_t hi = std::max(lo, o.max_block_bytes / gran);
+    double share = 0.0;
+    size_t block = lo * gran;
+    for (size_t m = lo; m <= hi; ++m) {
+        double worst = 1.0;
+        for (size_t s : sizes) worst = std::min(worst, (double) (m * gran / s * s) / (double) (m * gran));
+        if (worst > share) {
+            share = worst;
+            block = m * gran;
+        }
+    }
+    return {share, sizes.size() * block};
 }
 
 // --expert-cache auto: the budget is checked once it is WRITTEN.  Under Windows' WDDM an allocation is resident only
