@@ -18,7 +18,12 @@
 //  - the lender (make_glm_lender) and the lend commands over two such parts behind Glm5Model shells, a split on one
 //    card (and with STRATA_TEST_DEV2=<n> a second run with the second part on card n): each card's lendable, a lend
 //    whose blocks free the card's memory (on one card shared by the parts), a return refused as busy while another
-//    allocation holds the memory and then accepted, the tables consistent throughout, the other card unchanged.
+//    allocation holds the memory and then accepted, the tables consistent throughout, the other card unchanged; the
+//    whole-card footprint the shells carry (whole_mib_) comes out on the LENDABLE lines while no whole-card lease is
+//    open;
+//  - the whole-card lender's one-at-a-time rule (glm_whole_lend_allowed): a whole lend is allowed with no whole-card
+//    lease open and refused with one or more open (a second merged part would load under the wrong part count and
+//    the first lease's return would wait on the second's).
 #include "glm_fast_state.hpp"
 
 #include <cuda_runtime.h>
@@ -620,6 +625,14 @@ std::string ask(strata::core::LendCommands& c, const std::string& line) {
     return r;
 }
 
+// ---- the whole-card lender's rule, on its own: one whole-card lease at a time
+void test_whole_rule() {
+    std::printf("the whole-card lender's one-at-a-time rule\n");
+    CHECK(strata::core::glm_whole_lend_allowed(0), "a whole lend with no whole-card lease open is allowed");
+    CHECK(!strata::core::glm_whole_lend_allowed(1), "a second whole lend while one whole-card lease is open is refused");
+    CHECK(!strata::core::glm_whole_lend_allowed(2), "a whole lend while two whole-card leases are open is refused");
+}
+
 // ---- the lender over a two-part split, part one on card da (layers 0-1), part two on card db (layers 2-3); both on
 // one card when da == db.  The parts are synthetic as above, behind two Glm5Model shells.
 void test_lender(int da, int db) {
@@ -663,6 +676,15 @@ void test_lender(int da, int db) {
                   cards[1].lendable_mib == 32 && cards[0].block_mib == 16 && cards[1].block_mib == 16,
               "two cards: %zu cards", cards.size());
     const std::string D = std::to_string(da), E = std::to_string(db);
+    // the footprint a shell carries (lend_whole_check's pass) is what LENDABLE announces while no whole-card lease is
+    // open (on one card the head part's figure is the card's)
+    a->whole_mib_ = 1234;
+    b->whole_mib_ = 5678;
+    CHECK(ask(cmd, "LENDABLE") == (one ? "LENDABLE dev=" + D + " lendable=64 lent=0 whole=1234\nEND\n"
+                                       : "LENDABLE dev=" + D + " lendable=32 lent=0 whole=1234\nLENDABLE dev=" + E +
+                                             " lendable=32 lent=0 whole=5678\nEND\n"),
+          "the whole-card footprint on the LENDABLE lines");
+    a->whole_mib_ = b->whole_mib_ = 0;
     CHECK(ask(cmd, "LEND 9 16") == "ERR NODEV 9\n", "no such card");
     CHECK(ask(cmd, "LEND " + D + " 1000") == (one ? "ERR MAX 64\n" : "ERR MAX 32\n"), "too much");
 
@@ -754,6 +776,7 @@ int main() {
     test_choose();
     test_park_budget();
     test_pool_bytes();
+    test_whole_rule();
     int dev = 0, n = 0;
     if (const char* e = std::getenv("STRATA_TEST_DEV")) dev = std::atoi(e);
     if (cudaGetDeviceCount(&n) != cudaSuccess || n <= dev) {
