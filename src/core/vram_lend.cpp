@@ -84,9 +84,20 @@ std::size_t LendCommands::lent_mib(int dev) const {
     return sum;
 }
 
+bool LendCommands::lease_open(int dev, bool whole) const {
+    for (const auto& [id, l] : leases_)
+        if (l.dev == dev && l.whole == whole) return true;
+    return false;
+}
+
 std::vector<LendCardStatus> LendCommands::status() {
     std::vector<LendCardStatus> out;
-    for (const LendCard& c : lender_.lend_cards()) out.push_back({c.dev, c.lendable_mib, lent_mib(c.dev), c.block_mib});
+    for (const LendCard& c : lender_.lend_cards()) {
+        // a whole-card lease out: the card has nothing to lend, whatever pool figure the engine still reports
+        const bool whole_out = lease_open(c.dev, true);
+        out.push_back({c.dev, whole_out ? 0 : c.lendable_mib, lent_mib(c.dev), c.block_mib,
+                       whole_out ? 0 : lender_.whole_mib(c.dev)});
+    }
     return out;
 }
 
@@ -105,15 +116,16 @@ bool LendCommands::handle(const std::string& line, std::string& reply) {
         }
         for (const LendCardStatus& c : status())
             reply += "LENDABLE dev=" + std::to_string(c.dev) + " lendable=" + std::to_string(c.lendable_mib) +
-                     " lent=" + std::to_string(c.lent_mib) + "\n";
+                     " lent=" + std::to_string(c.lent_mib) + " whole=" + std::to_string(c.whole_mib) + "\n";
         reply += "END\n";
         return true;
     }
 
     if (cmd == "LEND") {
         std::uint64_t dev64 = 0, mib64 = 0;
-        if (w.size() != 3 || !parse_u64(w[1], dev64) || dev64 > (std::uint64_t) INT_MAX || !parse_u64(w[2], mib64) ||
-            mib64 == 0 || mib64 > (std::uint64_t) SIZE_MAX) {
+        const bool whole = w.size() == 3 && w[2] == "ALL";   // the whole card; any other third word is a size
+        if (w.size() != 3 || !parse_u64(w[1], dev64) || dev64 > (std::uint64_t) INT_MAX ||
+            (!whole && (!parse_u64(w[2], mib64) || mib64 == 0 || mib64 > (std::uint64_t) SIZE_MAX))) {
             reply = "ERR MALFORMED LEND <dev> <mib>\n";
             return true;
         }
@@ -129,7 +141,24 @@ bool LendCommands::handle(const std::string& line, std::string& reply) {
         }
         // whole blocks only: what the card has, down to blocks (the engine's figure already is), and the request up
         const std::size_t block = card->block_mib;
-        const std::size_t max = block ? card->lendable_mib / block * block : 0;
+        // a whole-card lease out: the card has nothing to lend, of either kind
+        const std::size_t max = lease_open(dev, true) ? 0 : block ? card->lendable_mib / block * block : 0;
+        if (whole) {
+            // only a card with a footprint and no lease of either kind on it: the two kinds never share a card
+            if (lender_.whole_mib(dev) == 0 || lease_open(dev, true) || lease_open(dev, false)) {
+                reply = "ERR MAX " + std::to_string(max) + "\n";
+                return true;
+            }
+            const LendResult r = lender_.lend_whole(dev);
+            if (!r.ok) {
+                reply = "ERR MAX " + std::to_string(r.max_mib) + "\n";
+                return true;
+            }
+            const std::uint64_t id = g_next_lease_id.fetch_add(1);
+            leases_[id] = {dev, r.mib, r.token, true};
+            reply = "LENT " + std::to_string(id) + " " + std::to_string(dev) + " " + std::to_string(r.mib) + "\n";
+            return true;
+        }
         if (mib > max) {
             reply = "ERR MAX " + std::to_string(max) + "\n";
             return true;
