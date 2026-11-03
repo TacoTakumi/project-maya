@@ -15,6 +15,9 @@
 //    sum but holding the lent tier -> the sum; free RAM unknown (0) -> the sum, the rule skipped;
 //  - the neighbour choice: the adjacent part with the most pool room takes the layers, the previous on a tie;
 //  - a lone part, and a device two parts share, refuse.
+//  - the devices to check again after a re-split reload (resplit_recheck_devs): of the parts loaded again, those the
+//    operator named with --lend-whole, in the reloaded order, each once; a device not named is left out (the check
+//    would announce a footprint the operator did not ask for).
 #include "strata/core/glm_model.hpp"
 
 #include <cstdint>
@@ -26,6 +29,7 @@ using strata::core::RamBound;
 using strata::core::ResplitPart;
 using strata::core::ResplitRoom;
 using strata::core::ram_bound_name;
+using strata::core::resplit_recheck_devs;
 using strata::core::resplit_room;
 
 namespace {
@@ -248,6 +252,17 @@ void test_neighbour_choice() {
     CHECK(!resplit_room(p, 2, 14 * kGiB - 1, 6 * kGiB).ok, "the lent part's 8 GiB tier still must fit the free RAM");
 }
 
+// ---- the devices a re-split reload checks again: the reloaded parts' devices that the operator named
+void test_recheck_devs() {
+    using V = std::vector<int>;
+    CHECK(resplit_recheck_devs({1, 2}, {2}) == V{2}, "one card named: the neighbour reloaded with it is not checked");
+    CHECK((resplit_recheck_devs({3, 2}, {2, 3}) == V{3, 2}), "both named: both, in the reloaded order");
+    CHECK(resplit_recheck_devs({1, 2}, {}) == V{}, "none named: none");
+    CHECK(resplit_recheck_devs({2, 2}, {2}) == V{2}, "a device reloaded twice (two parts on it): once");
+    CHECK(resplit_recheck_devs({1, 2}, {9}) == V{}, "a named card the reload did not touch: none");
+    CHECK((resplit_recheck_devs({1, 2}, {2, 2, 9}) == V{2}), "the named list with a repeat and a stranger: the one reloaded");
+}
+
 }  // namespace
 
 int main() {
@@ -257,6 +272,7 @@ int main() {
     test_ram_headroom();
     test_merged_tier();
     test_neighbour_choice();
+    test_recheck_devs();
     if (g_fail == 0) std::printf("glm_resplit_test: all passed\n");
     return g_fail == 0 ? 0 : 1;
 }

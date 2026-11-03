@@ -20,7 +20,8 @@
 //    whose blocks free the card's memory (on one card shared by the parts), a return refused as busy while another
 //    allocation holds the memory and then accepted, the tables consistent throughout, the other card unchanged; the
 //    whole-card footprint the shells carry (whole_mib_) comes out on the LENDABLE lines while no whole-card lease is
-//    open;
+//    open; the load-time room check (lend_whole_check) keeps --lend-whole's list on the head part as given, and over
+//    two parts (a first and a last) it passes neither;
 //  - the whole-card lender's one-at-a-time rule (glm_whole_lend_allowed): a whole lend is allowed with no whole-card
 //    lease open and refused with one or more open (a second merged part would load under the wrong part count and
 //    the first lease's return would wait on the second's).
@@ -685,6 +686,20 @@ void test_lender(int da, int db) {
                                              " lendable=32 lent=0 whole=5678\nEND\n"),
           "the whole-card footprint on the LENDABLE lines");
     a->whole_mib_ = b->whole_mib_ = 0;
+    // the load-time check keeps --lend-whole's list on the head part, as given (the re-split reloads read it to pick
+    // the reloaded cards to check again); over these two parts no card passes the lend's rules (the first part is the
+    // model object the engine holds, the last holds the head; on one card the two share it), so no footprint is set
+    CHECK(a->lend_whole_devs().empty(), "no --lend-whole list before the check");
+    a->lend_whole_check({da, db});
+    CHECK((a->lend_whole_devs() == std::vector<int>{da, db}), "the check keeps the list as given: %zu cards",
+          a->lend_whole_devs().size());
+    CHECK(a->whole_mib_ == 0 && b->whole_mib_ == 0, "no footprint: neither part may be lent whole here");
+    CHECK(ask(cmd, "LENDABLE") == (one ? "LENDABLE dev=" + D + " lendable=64 lent=0 whole=0\nEND\n"
+                                       : "LENDABLE dev=" + D + " lendable=32 lent=0 whole=0\nLENDABLE dev=" + E +
+                                             " lendable=32 lent=0 whole=0\nEND\n"),
+          "whole=0 on the LENDABLE lines after the check");
+    a->lend_whole_check({});
+    CHECK(a->lend_whole_devs().empty(), "an empty list is kept too");
     CHECK(ask(cmd, "LEND 9 16") == "ERR NODEV 9\n", "no such card");
     CHECK(ask(cmd, "LEND " + D + " 1000") == (one ? "ERR MAX 64\n" : "ERR MAX 32\n"), "too much");
 
