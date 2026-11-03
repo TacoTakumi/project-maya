@@ -5,10 +5,17 @@
 //           floor (pool_keep slots a layer), the previous on a tie - has room in its pool for the card's dense
 //           weights + KV + pool floor: the pool's slots give way to the layers that move in, down to the floor the
 //           lend rule keeps anyway (glm_lend.cu);
-//   RAM     the merged RAM tier - the neighbour's as pinned plus the lent part's, which the neighbour pins anew before
-//           the lent part's own is released - stays within the neighbour's tier plus what the host can pin now under
-//           the headroom the tier sizing keeps free (fast_setup: MemAvailable less STRATA_GLM_RAM_HEADROOM_GB, 6 GB
-//           on a discrete card, 16 on unified memory).
+//   RAM     the lent part's RAM tier, which the neighbour pins anew for the merged tier before the lent part's own is
+//           released, fits in the RAM free now under the headroom the tier sizing keeps free (fast_setup:
+//           MemAvailable plus the ZFS ARC's reclaimable part, less STRATA_GLM_RAM_HEADROOM_GB, 6 GB on a discrete
+//           card, 16 on unified memory).  A pass also sizes the merged tier (ResplitRoom::ram, bound), as a FIRST
+//           load would size a part of the merged range: the free RAM under the headroom, bounded by what the merged
+//           layers can use - every routed expert of theirs outside the merged pool's main slots plus the spares a
+//           layer (the load's own per-class cap, fast_setup's cls_cap; the merged pool keeps the neighbour's main
+//           slots less the lent part's dense weights and KV, which move in) - and never below the two tiers' sum,
+//           which is what the free RAM unknown gives.  The sum alone left the merged part short: on five cards the
+//           merged part held 99-132 slots a layer in VRAM with the sum's 18 GB tier, read about 5 experts a token
+//           from disk and decoded at half the speed, while some 57 GB of host RAM sat free.
 // The footprint a pass reports is everything the part holds on its card as the VRAM line counts it - dense weights,
 // sequence state, activations, a drafter, the verify window, the expert pool as mapped - in whole MiB rounded up.  The
 // CUDA context is not in it: the card's total - free also holds other programs' memory, so it is not the part's.
@@ -33,9 +40,11 @@
 //            after it along), the later one first: each part frees its device and pinned memory under its own
 //            device, as at exit;
 //   load     one part with the merged layer range on the neighbour's device, through load_pack as load_pack_split
-//            loads a part - the same pack, context, drafter path and expert profile; its RAM tier budget is the two
-//            tiers' sum (ram_budget_: the tier is not derived again, the RAM rule above was checked against this
-//            figure), the pool carved from the card's free VRAM as at the load, the warm-up as at the load.  The part
+//            loads a part - the same pack, context, drafter path and expert profile; its RAM tier budget is the
+//            plan's merged tier (WholePlan::ram, the room check's figure above; ram_budget_: the tier is not derived
+//            again from the free RAM, which the destroyed parts' tiers have just swollen - the load still caps each
+//            slot class at what its layers can use, so the tier pinned may come out a little under the budget), the
+//            pool carved from the card's free VRAM as at the load, the warm-up as at the load.  The part
 //            count it loads with is the OLD one: the CPU lane's shared pool is sized from it, and the survivors keep
 //            theirs (a new count would open a second pool beside it);
 //   link     split_next_ re-linked around it; every part's part index, count and device list set to the new split;
@@ -123,6 +132,14 @@ uint64_t ram_avail_now() {
 
 }  // namespace
 
+const char* ram_bound_name(RamBound b) {
+    switch (b) {
+        case RamBound::kFree: return "the free RAM under the headroom";
+        case RamBound::kLayers: return "the layers' bound";
+        default: return "the two tiers' sum";
+    }
+}
+
 ResplitRoom resplit_room(const std::vector<ResplitPart>& parts, int dev, uint64_t ram_avail, uint64_t ram_headroom) {
     ResplitRoom r;
     int at = -1, n_at = 0;
@@ -168,17 +185,32 @@ ResplitRoom resplit_room(const std::vector<ResplitPart>& parts, int dev, uint64_
         return r;
     }
     const ResplitPart& nb = parts[(size_t) best.idx];
+    // the merged RAM tier: the two tiers' sum at least (the neighbour's is released and pinned again, the lent part's
+    // pinned anew - the RAM rule below holds the lent part's in the free RAM), and more when the free RAM allows it
+    const uint64_t sum = nb.ram + m.ram;
+    r.ram = sum;
+    r.bound = RamBound::kSum;
     if (ram_avail > 0) {
-        const uint64_t merged = nb.ram + m.ram;
         const uint64_t free_room = ram_avail > ram_headroom ? ram_avail - ram_headroom : 0;
-        const uint64_t limit = nb.ram + free_room;
-        if (merged > limit) {
-            const std::string nbc = "CUDA" + std::to_string(nb.dev);
-            r.reason = "RAM: the merged tier " + mib(merged) + " MiB (" + nbc + " " + mib(nb.ram) + " + " + card + " " +
-                       mib(m.ram) + " pinned anew) is over the " + mib(limit) + " MiB the host can pin (" + nbc +
-                       "'s tier + " + mib(free_room) + " MiB free under the headroom " + mib(ram_headroom) +
-                       " MiB): short " + mib(merged - limit) + " MiB";
+        if (m.ram > free_room) {
+            r.ram = 0;
+            r.reason = "RAM: " + card + "'s tier " + mib(m.ram) + " MiB, pinned anew by CUDA" + std::to_string(nb.dev) +
+                       " for the merged tier, is over the " + mib(free_room) + " MiB free under the headroom " +
+                       mib(ram_headroom) + " MiB (" + mib(ram_avail) + " MiB free): short " + mib(m.ram - free_room) +
+                       " MiB";
             return r;
+        }
+        // what a first load would give a part of the merged size: the free RAM under the headroom, bounded by what the
+        // merged layers can use - every routed expert of theirs outside the merged pool's main slots, plus the spares a
+        // layer the tier sizing adds (the load caps each slot class the same way: fast_setup's cls_cap).  The merged
+        // pool keeps the neighbour's main slots less the lent part's dense weights and KV, which move in
+        const uint64_t moved = m.weights + m.kv;
+        const uint64_t held = nb.held > moved ? nb.held - moved : 0;
+        const uint64_t all = nb.experts + m.experts + nb.spares + m.spares;
+        const uint64_t cap = all > held ? all - held : 0;
+        if (free_room > sum && cap > sum) {
+            r.ram = std::min(free_room, cap);
+            r.bound = free_room >= cap ? RamBound::kLayers : RamBound::kFree;
         }
     }
     r.ok = true;
@@ -238,7 +270,16 @@ void Glm5Model::resplit_figures(std::vector<ResplitPart>& parts, std::vector<Glm
             size_t stride_sum = 0;
             for (int il = m->l0_; il < m->lt_ && (size_t) il < F->L.size(); ++il) {
                 const auto& Ly = F->L[(size_t) il];
-                if (Ly.moe) stride_sum += glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type);
+                if (!Ly.moe) continue;
+                stride_sum += glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type);
+                // the RAM tier's bound for the layer, at the tier's slot stride (fast_setup's class stride): every
+                // routed expert, the spares a layer the tier sizing adds (kSpares + 2 + the slack), and the experts the
+                // pool's main slots hold - the tail is borrowed by a prompt, so it counts as not held, as the sizing has it
+                const uint64_t st = (Ly.blob + 4095u) & ~(uint64_t) 4095u;
+                p.experts += (uint64_t) m->g_.n_expert * st;
+                p.spares += (uint64_t) (gf::kSpares + 2 + F->ram_slack) * st;
+                if ((size_t) il < F->lp.size())
+                    p.held += (uint64_t) std::max(0, std::min(m->g_.n_expert, F->lp[(size_t) il].n_main)) * st;
             }
             p.floor = (uint64_t) pool_keep(m->g_.n_exp_used) * stride_sum;
         }
@@ -275,10 +316,13 @@ void Glm5Model::lend_whole_check(const std::vector<int>& devs) {
         const ResplitPart& nb = parts[(size_t) r.into];
         std::fprintf(stderr, "glm lend: CUDA%d may be lent whole: %llu MiB (dense %llu, KV %llu, pool %llu MiB); its "
                              "layers [%d,%d) would move into CUDA%d's pool (%llu MiB above its floor), the merged RAM "
-                             "tier %llu MiB\n", dev, (unsigned long long) r.whole_mib,
+                             "tier the lend pins %llu MiB (%s; the two tiers' sum %llu MiB, %llu MiB free under the "
+                             "headroom)\n", dev, (unsigned long long) r.whole_mib,
                      (unsigned long long) (m.weights >> 20), (unsigned long long) (m.kv >> 20),
                      (unsigned long long) (m.pool >> 20), m.l0, m.l1, nb.dev, (unsigned long long) (room_of(nb) >> 20),
-                     (unsigned long long) ((nb.ram + m.ram) >> 20));
+                     (unsigned long long) (r.ram >> 20), ram_bound_name(r.bound),
+                     (unsigned long long) ((nb.ram + m.ram) >> 20),
+                     (unsigned long long) ((avail > head_b ? avail - head_b : 0) >> 20));
     }
 }
 
@@ -314,6 +358,8 @@ bool Glm5Model::lend_whole_plan(int dev, WholePlan& plan, std::string& err) {
     plan.into = chain[(size_t) r.into];
     plan.mib = chain[at]->whole_mib_;   // (the figure the LENDABLE lines announced)
     plan.dev = dev;
+    plan.ram = (int64_t) r.ram;         // the merged part's tier budget, sized on the RAM free now
+    plan.ram_bound = r.bound;
     // the two parts as they are, in chain order: what the return loads again
     const size_t lo = std::min(at, (size_t) r.into);
     for (size_t i = 0; i < 2; ++i) {
@@ -511,8 +557,11 @@ bool Glm5Model::lend_whole_run(const WholePlan& plan, std::string& err) {
     }
     const double t_save = ms_since(t1);
 
-    // ---- what the reload needs, read before the parts go
-    const WholePlan::Part merged{ndev, std::min(L->l0_, N->l0_), std::max(L->l1_, N->l1_), plan.lo.ram + plan.hi.ram};
+    // ---- what the reload needs, read before the parts go (the merged tier's budget: the plan's figure, sized on the
+    //      RAM free at plan time under the headroom and bounded by the merged layers; the load caps each slot class
+    //      at what its layers can use on top of it, so the tier pinned may come out a little under the budget)
+    const WholePlan::Part merged{ndev, std::min(L->l0_, N->l0_), std::max(L->l1_, N->l1_),
+                                 plan.ram >= 0 ? plan.ram : plan.lo.ram + plan.hi.ram};
     std::vector<int> devs_old, devs_new;
     for (Glm5Model* m : chain) {
         devs_old.push_back(m->dev_);
@@ -598,12 +647,15 @@ bool Glm5Model::lend_whole_run(const WholePlan& plan, std::string& err) {
 
     const std::string state = have_state ? "the conversation state at " + std::to_string(n_pos) + " positions carried over"
                                          : "no conversation state to carry";
-    std::fprintf(stderr, "glm lend: CUDA%d lent whole: CUDA%d now holds layers [%d, %d) (RAM tier %.2f GB); the split %s; "
-                         "%s | quiet %.0f ms, save %.0f ms (%.1f MB), destroy %.0f ms, load %.0f ms, link %.0f ms, "
-                         "restore %.0f ms, release %.0f ms, %.1f s in all\n",
+    std::fprintf(stderr, "glm lend: CUDA%d lent whole: CUDA%d now holds layers [%d, %d) (RAM tier %.2f GB pinned of a "
+                         "%.2f GB budget, %s; the two tiers' sum %.2f GB); the split %s; %s | quiet %.0f ms, save %.0f ms "
+                         "(%.1f MB), destroy %.0f ms, load %.0f ms, link %.0f ms, restore %.0f ms, release %.0f ms, %.1f s "
+                         "in all\n",
                  ldev, ndev, merged.l0, merged.l1, (double) npp->fast_->ram_bytes / 1073741824.0,
-                 resplit_where().c_str() + 7, state.c_str(), t_quiet, t_save, (double) slot.size() / 1048576.0,
-                 t_destroy, t_load, t_link, t_restore, t_release, ms_since(t_all) / 1000.0);
+                 (double) merged.ram / 1073741824.0, ram_bound_name(plan.ram_bound),
+                 (double) (plan.lo.ram + plan.hi.ram) / 1073741824.0, resplit_where().c_str() + 7, state.c_str(),
+                 t_quiet, t_save, (double) slot.size() / 1048576.0, t_destroy, t_load, t_link, t_restore, t_release,
+                 ms_since(t_all) / 1000.0);
     return true;
 }
 
@@ -638,8 +690,9 @@ bool Glm5Model::lend_whole_return(const WholePlan& plan, std::string& err) {
     const auto t_all = clock::now();
     const int ldev = plan.dev;
     const int ndev = plan.lo.dev == ldev ? plan.hi.dev : plan.lo.dev;
+    // (the merged part as the lend loaded it, should a part not load again and the merged part be rebuilt)
     const WholePlan::Part merged{ndev, std::min(plan.lo.l0, plan.hi.l0), std::max(plan.lo.l1, plan.hi.l1),
-                                 plan.lo.ram + plan.hi.ram};
+                                 plan.ram >= 0 ? plan.ram : plan.lo.ram + plan.hi.ram};
     std::vector<Glm5Model*> chain = chain_of(this);
     int mi = -1;
     for (size_t i = 0; i < chain.size(); ++i)
