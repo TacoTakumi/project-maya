@@ -10,6 +10,9 @@
 //    changes nothing;
 //  - the RAM tier's share of a lend (lend_park_budget, STRATA_GLM_LEND_PARK_MB): with a budget of one slot only the
 //    hottest leaving expert is copied to RAM, with none every one goes to disk, the moves the same either way;
+//  - lend_tail (the prompt path's loan of the pool's tail) on a failed copy-stream sync: it refuses before any slot
+//    is touched and the background hold it set comes off again (the hold stayed on once: no promotion for the rest of
+//    the engine's life);
 //  - the pool's budget in slot bytes (pool_fit, pool_bytes_for, pool_slot_bytes): a budget sized for every expert
 //    holds every expert once scaled back, for every slot size from 1 to 20 MiB;
 //  - the lender (make_glm_lender) and the lend commands over two such parts behind Glm5Model shells, a split on one
@@ -538,6 +541,47 @@ void test_part_budget(int dev, size_t budget, int want_parked) {
     CHECK(cudaDeviceSynchronize() == cudaSuccess, "device: %s", cudaGetErrorString(cudaGetLastError()));
 }
 
+// ---- lend_tail's early return: the copy stream in capture mode makes its first sync fail (an error that sticks to
+// nothing: the stream is usable again once the capture ends), before any slot is touched.  The background hold the
+// lending set must be off afterwards, or the decode runs without promotions until the engine stops.
+void test_tail_hold(int dev) {
+    std::printf("lend_tail's hold on a failed copy sync\n");
+    cudaSetDevice(dev);
+    Part part;
+    std::string err;
+    if (!setup(part, dev, err)) {
+        std::printf("SKIP the GPU part: %s\n", err.c_str());
+        return;
+    }
+    FastState& F = *part.F;
+    // a shell as in test_lender (never destroyed: fast_ is the part's)
+    Glm5Model* m = new Glm5Model();
+    m->fast_ = &F;
+    m->dev_ = dev;
+    m->l0_ = 0;
+    m->l1_ = m->lt_ = NL;
+    auto& g = const_cast<strata::core::Glm5Geometry&>(m->geometry());
+    g.n_expert = NE;
+    g.n_exp_used = 1;
+    CHECK(cudaStreamBeginCapture(F.copy, cudaStreamCaptureModeRelaxed) == cudaSuccess, "capture: %s",
+          cudaGetErrorString(cudaGetLastError()));
+    uint64_t moved = 0, dropped = 0;
+    CHECK(!m->lend_tail(2 * kBlock, moved, dropped, err), "the lend must fail on the copy sync");
+    CHECK(err.find("glm lending copies") != std::string::npos, "the cause: %s", err.c_str());
+    CHECK(!F.bg_hold, "the background hold stays on after the failed lend");
+    CHECK(moved == 0 && dropped == 0 && F.lp[0].n_lent == 0 && F.lp[1].n_lent == 0, "nothing lent: moved %llu dropped %llu",
+          (unsigned long long) moved, (unsigned long long) dropped);
+    for (int il = 0; il < NL; ++il)
+        for (int s = 0; s < kMain; ++s)
+            CHECK(F.lp[(size_t) il].st[(size_t) s] != FastState::kLent, "layer %d slot %d lent", il, s);
+    cudaGraph_t graph = nullptr;
+    cudaStreamEndCapture(F.copy, &graph);   // (the sync invalidated the capture: no graph, the stream is free)
+    cudaGetLastError();
+    CHECK(graph == nullptr && cudaStreamSynchronize(F.copy) == cudaSuccess, "the copy stream after the capture: %s",
+          cudaGetErrorString(cudaGetLastError()));
+    CHECK(cudaDeviceSynchronize() == cudaSuccess, "device: %s", cudaGetErrorString(cudaGetLastError()));
+}
+
 size_t card_free(int dev) {
     cudaSetDevice(dev);
     size_t f = 0, t = 0;
@@ -648,8 +692,9 @@ void test_lender(int da, int db) {
         CHECK((size_t) slots * kStride == lent_b, "lent slots %d", slots);
         if (!one) CHECK(pb.F->lp[NL].n_lent == 0 && pb.F->lp[NL + 1].n_lent == 0, "part two untouched");
     }
-    CHECK(ask(cmd, "LENDABLE") == "LENDABLE dev=" + D + " lendable=" + (one ? "16" : "0") + " lent=" + want_mib + "\n" +
-                                      (one ? "" : "LENDABLE dev=" + E + " lendable=32 lent=0\n") + "END\n",
+    CHECK(ask(cmd, "LENDABLE") == "LENDABLE dev=" + D + " lendable=" + (one ? "16" : "0") + " lent=" + want_mib +
+                                      " whole=0\n" + (one ? "" : "LENDABLE dev=" + E + " lendable=32 lent=0 whole=0\n") +
+                                      "END\n",
           "lendable while lent");
 
     // the return while another allocation holds the memory: busy, the lease stays; then it goes back
@@ -718,6 +763,7 @@ int main() {
         test_part(dev);
         test_part_budget(dev, kStride + kStride / 2, 1);   // one slot's worth and a half: one expert
         test_part_budget(dev, 0, 0);
+        test_tail_hold(dev);
         test_lender(dev, dev);
         // STRATA_TEST_DEV2=<n>: the split's second part on that card
         if (const char* e = std::getenv("STRATA_TEST_DEV2"); e != nullptr && std::atoi(e) != dev && std::atoi(e) < n)
