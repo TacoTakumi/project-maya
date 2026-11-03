@@ -53,6 +53,11 @@ class Workers;
 }  // namespace glmfast
 
 struct ResplitPart;   // (below the class: a whole-card lend's room check figures)
+/// Which bound sized the merged RAM tier of a whole-card lend (resplit_room, src/core/glm_resplit.cu): the two
+/// parts' tiers' sum (the free RAM allows no more, or it is unknown), the RAM free under the headroom at lend time,
+/// or the layers' bound (every expert of the merged layers outside VRAM, plus the spares: the tier needs no more)
+enum class RamBound { kSum, kFree, kLayers };
+const char* ram_bound_name(RamBound b);
 
 /// One served weight: F32 (dequantized at load) or a ggml-quantized row tensor uploaded RAW to
 /// VRAM and dotted by the device MMVQ.  type 0 = F32.
@@ -248,6 +253,11 @@ public:
         };
         Part lo, hi;
         int n_parts = 0;
+        // the merged part's RAM tier budget (ram_budget_ of the lend's load): resplit_room's figure - sized from the RAM
+        // free at lend time under the headroom, as a first load would size it, bounded by what the merged layers can
+        // use and never below the two tiers' sum - and the bound that set it (the log names it)
+        int64_t ram = -1;
+        RamBound ram_bound = RamBound::kSum;
     };
     bool lend_whole_plan(int dev, WholePlan& plan, std::string& err);
     /// The return's room check, before anything changes: the lent card's free VRAM (cudaMemGetInfo under it, which
@@ -1214,13 +1224,17 @@ size_t glm_prefill_lend_bytes(const Glm5Geometry& g, size_t T, bool has_kda, boo
 /// layer, in the pool bytes they take) and its pinned RAM tier.  resplit_room(parts, dev, ram_avail, ram_headroom):
 /// the card `dev` may be lent whole when an ADJACENT part - the previous or the next in the chain, the one with the
 /// most pool room above its own floor, the previous on a tie - has room there for the card's dense weights + KV +
-/// pool floor (its layers move into that pool), AND the merged RAM tier - the neighbour's as pinned plus the lent
-/// part's, which the neighbour pins anew before the lent part's own is released - stays within the neighbour's tier
-/// plus what the host can pin now under the headroom (ram_avail: MemAvailable now, as the tier sizing reads it, 0 =
-/// unknown and the RAM rule is skipped; ram_headroom: STRATA_GLM_RAM_HEADROOM_GB, the figure the tier sizing keeps
-/// free).  A pass gives the neighbour's index and the footprint: everything the part holds on its card, in whole MiB
-/// rounded up (the CUDA context is not counted: the card's total - free also holds other programs' memory).  A fail
-/// gives a reason, "not in the split" for a device no part runs on; a device two parts share and a lone part refuse.
+/// pool floor (its layers move into that pool), AND the lent part's RAM tier, which the neighbour pins anew for the
+/// merged tier before the lent part's own is released, fits in the RAM free now under the headroom (ram_avail:
+/// MemAvailable now, as the tier sizing reads it, 0 = unknown and the RAM rule is skipped; ram_headroom:
+/// STRATA_GLM_RAM_HEADROOM_GB, the figure the tier sizing keeps free).  A pass gives the neighbour's index, the
+/// footprint - everything the part holds on its card, in whole MiB rounded up (the CUDA context is not counted: the
+/// card's total - free also holds other programs' memory) - and the merged RAM tier the lend pins (ram, bound): what a
+/// first load would give a part of the merged size, the free RAM under the headroom, bounded by what the merged layers
+/// can use (their experts outside the merged pool's main slots, plus the spares a layer the tier sizing adds; the
+/// neighbour's main slots less the lent part's dense weights and KV, which move into its pool) and never below the two
+/// tiers' sum (the free RAM unknown: the sum).  A fail gives a reason, "not in the split" for a device no part runs
+/// on; a device two parts share and a lone part refuse.
 struct ResplitPart {
     int dev = 0;
     int l0 = 0, l1 = 0;
@@ -1228,11 +1242,16 @@ struct ResplitPart {
     uint64_t pool = 0;       // the expert pool's bytes on the card (the main slots as mapped, and the tail)
     uint64_t floor = 0;      // what a lend leaves the pool: pool_keep slots a layer, in pool bytes
     uint64_t ram = 0;        // the pinned RAM tier
+    // the RAM tier's bound for the part's MoE layers, at the tier's slot stride: every routed expert of those layers,
+    // the spare slots a layer the tier sizing adds, and the experts the pool's main slots hold (in VRAM)
+    uint64_t experts = 0, spares = 0, held = 0;
 };
 struct ResplitRoom {
     bool ok = false;
     int into = -1;           // the part (an index into parts) that takes the card's layers
     uint64_t whole_mib = 0;  // the card's whole-card footprint (a pass)
+    uint64_t ram = 0;        // the merged RAM tier the lend pins, bytes (a pass)
+    RamBound bound = RamBound::kSum;   // which bound set it
     std::string reason;      // why not (a fail)
 };
 ResplitRoom resplit_room(const std::vector<ResplitPart>& parts, int dev, uint64_t ram_avail, uint64_t ram_headroom);
