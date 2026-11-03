@@ -37,7 +37,9 @@ the engine's GPUs with lendable and lent 0 (no GPUs at all for an engine that re
 commands between its steps, and one step can read a long prompt: a LEND it answers after the route stopped waiting
 (Lender.answer_s, POOL_WAIT_S = 30 s; a whole-card lend destroys the GPU's part first, so it gets Lender.whole_answer_s,
 WHOLE_WAIT_S = 180 s) still lends, and the server gives that lease back by itself - /vram/state lists it until the
-engine has it back.
+engine has it back.  A RETURN gets the same two waits by the lease's kind: the return of a whole-card lease makes the
+engine load the GPU's part again (26-27 s measured, more from a cold page cache), so it waits WHOLE_WAIT_S; a RETURN
+answered late still ends the lease when the answer comes.
 
 A GPU is named by its PCI address, matched whatever its case or spelling (gpu_map.pci_addr: CUDA's, NVML's 8-digit
 domain, lspci's without one) and answered as "0000:0a:00.0" - lower case, a 4-digit domain and the function, as lspci
@@ -62,8 +64,8 @@ import threading
 
 from serve import gpu_map
 
-POOL_WAIT_S = 30.0      # how long a route waits for the engine's answer: a lend from the pool, a return, LENDABLE
-WHOLE_WAIT_S = 180.0    # a whole-card lend: the engine tears its part on the GPU down before it answers
+POOL_WAIT_S = 30.0      # how long a route waits for the engine's answer: a lend from the pool, its return, LENDABLE
+WHOLE_WAIT_S = 180.0    # a whole-card lend, and its return: the engine tears its part on the GPU down / loads it again
 
 # The engine's answers to the lend commands: the server takes them off the request's lines (they come back while
 # requests run, untagged).  A request's own ERR never reads like these (the words after ERR are upper case here).
@@ -183,7 +185,7 @@ class Lender:
         self._top = 0                     # the highest id handed out
         self._can: bool | None = None     # the running engine takes the lend commands (None: not known yet)
         self.answer_s = POOL_WAIT_S       # how long a route waits for the engine's answer
-        self.whole_answer_s = WHOLE_WAIT_S   # ... to a whole-card lend
+        self.whole_answer_s = WHOLE_WAIT_S   # ... to a whole-card lend, and to the return of its lease
 
     # -- what the routes share
     def _sync(self, engine) -> bool:
@@ -405,12 +407,14 @@ class Lender:
         with self._lock:
             lease = dict(self._leases[lid]) if lid in self._leases and self._owner is owner else None
             eid = self._engine_id.get(lid)
+            whole = lid in self._whole                # (the engine loads the GPU's part again: the longer wait)
         if lease is None:                             # never lent by this engine process: nothing is sent
             if not self._lends(engine):
                 return self._unsupported()
             return 404, {"error": f"no open lease {lid}"}
         try:
-            got = self._ask(engine, f"RETURN {eid}", lambda got, waited: self._returned(owner, lid, got))
+            got = self._ask(engine, f"RETURN {eid}", lambda got, waited: self._returned(owner, lid, got),
+                            wait=self.whole_answer_s if whole else self.answer_s)
         except NoLending:
             return self._unsupported()
         except (RuntimeError, ValueError, OSError) as e:
