@@ -52,6 +52,28 @@
 // What is NOT carried: the host-RAM checkpoints (ckpt_save) of the two destroyed parts - a restore of one answers
 // "holds none" and the engine reads the prompt again; and an EXL3 head split whose helper or last part died - the
 // pick reads the whole head row on the last part from then on.
+//
+// THE RETURN (lend_whole_room, lend_whole_return; the lender calls them from give_back on a whole-card token).  The
+// plan the lend ran with carries the two parts as they were - device, layers, pinned RAM tier each - and the load's
+// part count (WholePlan::lo / hi / n_parts), so the reload is the lend's load in reverse:
+//   room     before anything changes: cudaMemGetInfo under the lent card (its primary context comes back for it)
+//            against the footprint the part had (plan.mib: the pool as it was mapped, the dense weights, KV, the
+//            rest).  Short of it another process still holds the card: one log line with the figures, the context
+//            released again, busy - the lease stays open and the caller tries later;
+//   quiet, save    as the lend's;
+//   destroy  the merged part, unlinked;
+//   load     the two parts through load_pack as before, the earlier first, each with its own device, layer range and
+//            RAM tier budget (ram_budget_: the tiers come back as they were), under the load's part count (the shared
+//            CPU lane pool is joined, not doubled); the lent card's context comes back with the first allocation.  A
+//            part that did not load: the merged part is loaded again and finished, the state put back, the context
+//            released, busy (the lease stays open);
+//   link, restore  as the lend's, for the two fresh parts;
+//   check    lend_whole_check for the card: the room check as at the load, so the footprint is announced again
+//            (whole_mib(dev), LENDABLE whole=) and the card may be lent whole once more.
+// The pools are carved from each card's free VRAM as at the load, so the parts come back with the layouts the load
+// gave them; their tiers warm again from the page cache as the decode routes.
+// The steps the two share - quiet, one part's load, the chain's finish - are resplit_quiet / resplit_make /
+// resplit_finish.
 #include "glm_fast_state.hpp"
 
 #include "strata/core/glm_model.hpp"
@@ -291,21 +313,163 @@ bool Glm5Model::lend_whole_plan(int dev, WholePlan& plan, std::string& err) {
     plan.lent = chain[at];
     plan.into = chain[(size_t) r.into];
     plan.mib = chain[at]->whole_mib_;   // (the figure the LENDABLE lines announced)
+    plan.dev = dev;
+    // the two parts as they are, in chain order: what the return loads again
+    const size_t lo = std::min(at, (size_t) r.into);
+    for (size_t i = 0; i < 2; ++i) {
+        const Glm5Model* m = chain[lo + i];
+        WholePlan::Part& p = i == 0 ? plan.lo : plan.hi;
+        p.dev = m->dev_;
+        p.l0 = m->l0_;
+        p.l1 = m->l1_;
+        p.ram = m->fast_ != nullptr ? (int64_t) m->fast_->ram_bytes : -1;
+        // the pool as it is: the budget it was carved from and its block (the return carves the same pool again)
+        p.pool = m->pool_b_.avail;
+        p.block = m->fast_ != nullptr && m->fast_->vpool.valid() ? m->fast_->vpool.block_bytes() : 0;
+    }
+    plan.n_parts = (int) chain.size();
     return true;
+}
+
+// ---- the steps the lend and the return share
+
+bool Glm5Model::resplit_quiet(const std::vector<Glm5Model*>& chain, std::string& err) {
+    ckpt_join();
+    win_commit_wait();
+    win_pipe_drain();
+    win_crew_stop();
+    for (Glm5Model* m : chain) {
+        FastState* F = m->fast_;
+        cudaSetDevice(m->dev_);
+        F->bg_hold = true;
+        if (!glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm lend copies", err) || !m->fast_boundary(err))
+            return false;
+        if (!F->bg.empty() || !F->draining.empty()) {
+            err = "glm lend: CUDA" + std::to_string(m->dev_) + " tier moves were not retired";
+            return false;
+        }
+        if (!glmfast::cuda_ok(cudaDeviceSynchronize(), "glm lend: the card's streams", err)) return false;
+    }
+    return true;
+}
+
+std::unique_ptr<Glm5Model> Glm5Model::resplit_make(const WholePlan::Part& sp, int idx, int n_parts,
+                                                   const std::vector<int>& devs) {
+    // (the pack, context, drafter and profile are this part's - the head, which no re-split destroys)
+    std::unique_ptr<Glm5Model> p(new Glm5Model());
+    p->n_parts_ = n_parts;   // (the CPU lane's shared pool is sized from the count: the survivors' pool is joined)
+    p->part_ = idx;
+    p->split_devs_ = devs;
+    p->dflash_path_ = dflash_path_;
+    p->profile_path_ = profile_path_;
+    p->ram_budget_ = sp.ram;
+    p->pool_want_ = (size_t) sp.pool;         // (the pool as the part had it; 0: from the free VRAM, as at a load)
+    p->pool_block_want_ = (size_t) sp.block;
+    p->defer_lane_ = true;   // (the lane and the service thread once the chain is linked, as load_pack_split)
+    p->head_half_ = false;
+    std::string e;
+    if (!p->load_pack(pack_dir_, max_ctx_, e, sp.dev, sp.l0, sp.l1 >= g_.n_layers ? 0 : sp.l1)) {
+        std::fprintf(stderr, "glm lend: CUDA%d layers [%d, %d) did not load: %s\n", sp.dev, sp.l0, sp.l1, e.c_str());
+        return nullptr;
+    }
+    return p;
+}
+
+bool Glm5Model::resplit_finish(const std::vector<Glm5Model*>& fresh, std::string& e) {
+    // the fresh parts' CPU lane and service thread first, still under the load's part count: the lane's thread count
+    // follows it, and the shared pool is the survivors' only while the count agrees
+    for (Glm5Model* f : fresh) {
+        f->defer_lane_ = false;
+        if (!f->fast_setup_finish(e)) return false;
+    }
+    std::vector<Glm5Model*> now;
+    std::vector<int> devs;
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        now.push_back(m);
+        devs.push_back(m->dev_);
+    }
+    for (size_t i = 0; i < now.size(); ++i) {
+        Glm5Model* m = now[i];
+        m->n_parts_ = (int) now.size();
+        m->part_ = (int) i;
+        m->split_devs_ = devs;
+        m->calc_pf_state_ = 0;   // (the prompt path's pairings: decided again at the next prompt)
+        m->dual_pf_state_ = 0;
+        if (m->fast_ != nullptr) m->fast_->win.from = nullptr;   // (set again by the next pipelined window)
+    }
+    // the pipelined window's slot bank: every part flips its own at each window's begin and reads the previous
+    // part's rows at the slot ITS bank names, so the parts must agree - a fresh part starts at 0 while the
+    // survivors have flipped theirs as many times as windows ran (the first lend after an odd number of windows
+    // read the other bank's stale rows: garbage from the merged part on)
+    for (Glm5Model* f : fresh)
+        if (f->fast_ != nullptr && fast_ != nullptr) f->fast_->win.bank = fast_->win.bank;
+    int tmin = 0;
+    for (Glm5Model* m : now)
+        if (m->prefill_chunk() > 0) tmin = tmin == 0 ? m->prefill_chunk() : std::min(tmin, m->prefill_chunk());
+    if (tmin > 0)
+        for (Glm5Model* m : now) m->prefill_cap(tmin, "the split's smallest");
+    if (!dflash_bind(e)) return false;
+    for (Glm5Model* f : fresh)
+        if (!f->fast_helper_check(e)) return false;
+    cudaSetDevice(dev_);
+    return true;
+}
+
+namespace {
+
+// the chain from the head, and the layout line the log prints for it
+std::vector<Glm5Model*> chain_of(Glm5Model* head) {
+    std::vector<Glm5Model*> chain;
+    for (Glm5Model* m = head; m != nullptr; m = m->split_next_.get()) chain.push_back(m);
+    return chain;
+}
+
+// the background hold off again on every part listed, whatever happens (a part about to be destroyed leaves the list)
+struct Holds {
+    std::vector<Glm5Model*> parts;
+    void drop(const Glm5Model* m) { parts.erase(std::remove(parts.begin(), parts.end(), m), parts.end()); }
+    ~Holds() {
+        for (Glm5Model* m : parts) m->fast_->bg_hold = false;
+    }
+};
+
+// the process off a card: its primary context released (nothing of this process is allocated there any more)
+void leave_card(int dev, int back_to) {
+    cudaSetDevice(dev);
+    const cudaError_t re = cudaDeviceReset();
+    // the kernels' per-device caches of what belonged to the context (scratch pointers, shared-memory opt-ins, a
+    // constant upload) are stale now: the first decode on the card after its return read a freed pointer
+    gf::device_context_reset(dev);
+    cudaSetDevice(back_to);
+    if (re != cudaSuccess)
+        std::fprintf(stderr, "glm lend: CUDA%d cudaDeviceReset: %s (the process may still show on the card)\n", dev,
+                     cudaGetErrorString(re));
+}
+
+}  // namespace
+
+std::string Glm5Model::resplit_where() const {
+    std::string where;
+    for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+        where += (m == this ? "layers [" : ", [") + std::to_string(m->l0_) + ", " + std::to_string(m->l1_) + ") on CUDA" +
+                 std::to_string(m->dev_);
+    return where;
 }
 
 bool Glm5Model::lend_whole_run(const WholePlan& plan, std::string& err) {
     using clock = std::chrono::steady_clock;
     const auto t_all = clock::now();
-    std::vector<Glm5Model*> chain;
-    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) chain.push_back(m);
+    std::vector<Glm5Model*> chain = chain_of(this);
     const int old_n = (int) chain.size();
     int at = -1, into = -1;
     for (int i = 0; i < old_n; ++i) {
         if (chain[(size_t) i] == plan.lent) at = i;
         if (chain[(size_t) i] == plan.into) into = i;
     }
-    if (at < 1 || into < 1 || at + 1 >= old_n || (into != at - 1 && into != at + 1)) {
+    const int lo = std::min(at, into);
+    if (at < 1 || into < 1 || at + 1 >= old_n || (into != at - 1 && into != at + 1) || old_n != plan.n_parts ||
+        plan.lo.dev != chain[(size_t) lo]->dev_ || plan.hi.dev != chain[(size_t) lo + 1]->dev_ ||
+        plan.dev != plan.lent->dev_) {
         err = "glm lend: the plan does not fit the split";
         return false;
     }
@@ -317,7 +481,6 @@ bool Glm5Model::lend_whole_run(const WholePlan& plan, std::string& err) {
     Glm5Model* L = plan.lent;
     Glm5Model* N = plan.into;
     const int ldev = L->dev_, ndev = N->dev_;
-    const int lo = std::min(at, into);
     Glm5Model* prev = chain[(size_t) lo - 1];
     Glm5Model* tail = chain.back();
     int prev_dev = 0;
@@ -328,35 +491,8 @@ bool Glm5Model::lend_whole_run(const WholePlan& plan, std::string& err) {
     } dev_back{prev_dev};
 
     // ---- quiet: nothing runs, nothing moves, every stream of every card done
-    ckpt_join();
-    win_commit_wait();
-    win_pipe_drain();
-    win_crew_stop();
-    struct Holds {   // the background hold off again on every survivor, whatever happens
-        std::vector<Glm5Model*> parts;
-        ~Holds() {
-            for (Glm5Model* m : parts) m->fast_->bg_hold = false;
-        }
-    } holds;
-    for (Glm5Model* m : chain) {
-        FastState* F = m->fast_;
-        cudaSetDevice(m->dev_);
-        F->bg_hold = true;
-        if (m != L && m != N) holds.parts.push_back(m);
-        if (!glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm lend copies", err) || !m->fast_boundary(err)) {
-            L->fast_->bg_hold = N->fast_->bg_hold = false;
-            return false;
-        }
-        if (!F->bg.empty() || !F->draining.empty()) {
-            err = "glm lend: CUDA" + std::to_string(m->dev_) + " tier moves were not retired";
-            L->fast_->bg_hold = N->fast_->bg_hold = false;
-            return false;
-        }
-        if (!glmfast::cuda_ok(cudaDeviceSynchronize(), "glm lend: the card's streams", err)) {
-            L->fast_->bg_hold = N->fast_->bg_hold = false;
-            return false;
-        }
-    }
+    Holds holds{chain};
+    if (!resplit_quiet(chain, err)) return false;
     const double t_quiet = ms_since(t_all);
 
     // ---- save: the conversation state to RAM (nothing to carry without a snapshot)
@@ -369,7 +505,6 @@ bool Glm5Model::lend_whole_run(const WholePlan& plan, std::string& err) {
         std::string e;
         if (slot_save(slot, e) == 0) {
             err = "glm lend: the conversation state did not save: " + e;
-            L->fast_->bg_hold = N->fast_->bg_hold = false;
             return false;
         }
         n_pos = snap_pos_;
@@ -377,28 +512,19 @@ bool Glm5Model::lend_whole_run(const WholePlan& plan, std::string& err) {
     const double t_save = ms_since(t1);
 
     // ---- what the reload needs, read before the parts go
-    struct Spec {
-        int dev, l0, l1, idx;
-        int64_t ram;
-    };
-    const Spec spec_lo{chain[(size_t) lo]->dev_, chain[(size_t) lo]->l0_, chain[(size_t) lo]->l1_, lo,
-                       (int64_t) chain[(size_t) lo]->fast_->ram_bytes};
-    const Spec spec_hi{chain[(size_t) lo + 1]->dev_, chain[(size_t) lo + 1]->l0_, chain[(size_t) lo + 1]->l1_, lo + 1,
-                       (int64_t) chain[(size_t) lo + 1]->fast_->ram_bytes};
-    const Spec spec_merged{ndev, std::min(L->l0_, N->l0_), std::max(L->l1_, N->l1_), lo, spec_lo.ram + spec_hi.ram};
+    const WholePlan::Part merged{ndev, std::min(L->l0_, N->l0_), std::max(L->l1_, N->l1_), plan.lo.ram + plan.hi.ram};
     std::vector<int> devs_old, devs_new;
     for (Glm5Model* m : chain) {
         devs_old.push_back(m->dev_);
         if (m != L) devs_new.push_back(m->dev_);
     }
-    const std::string pack = pack_dir_, dpath = dflash_path_, ppath = profile_path_;
-    const int64_t ctx = max_ctx_;
-    const int n_layers = g_.n_layers;
     // an EXL3 head split whose helper dies: the last part's pick reads the whole head row from now on
     if (tail->head_helper_ == L || tail->head_helper_ == N) tail->head_helper_ = nullptr;
 
     // ---- destroy: the two parts out of the chain, the later one first
     const auto t2 = clock::now();
+    holds.drop(L);
+    holds.drop(N);
     std::unique_ptr<Glm5Model> first = std::move(prev->split_next_);
     std::unique_ptr<Glm5Model> second = std::move(first->split_next_);
     std::unique_ptr<Glm5Model> rest = std::move(second->split_next_);
@@ -408,76 +534,19 @@ bool Glm5Model::lend_whole_run(const WholePlan& plan, std::string& err) {
     const double t_destroy = ms_since(t2);
 
     // ---- load: one part through load_pack, as load_pack_split loads a part
-    const auto make = [&](const Spec& sp, const std::vector<int>& devs) -> std::unique_ptr<Glm5Model> {
-        std::unique_ptr<Glm5Model> p(new Glm5Model());
-        p->n_parts_ = old_n;   // (the CPU lane's shared pool is sized from the count: the survivors' pool is joined)
-        p->part_ = sp.idx;
-        p->split_devs_ = devs;
-        p->dflash_path_ = dpath;
-        p->profile_path_ = ppath;
-        p->ram_budget_ = sp.ram;
-        p->defer_lane_ = true;   // (the lane and the service thread once the chain is linked, as load_pack_split)
-        p->head_half_ = false;
-        std::string e;
-        if (!p->load_pack(pack, ctx, e, sp.dev, sp.l0, sp.l1 >= n_layers ? 0 : sp.l1)) {
-            std::fprintf(stderr, "glm lend: CUDA%d layers [%d, %d) did not load: %s\n", sp.dev, sp.l0, sp.l1, e.c_str());
-            return nullptr;
-        }
-        return p;
-    };
-    // the chain finished as load_pack_split finishes it, the fresh parts' lanes and service threads up
-    const auto finish = [&](const std::vector<Glm5Model*>& fresh, std::string& e) -> bool {
-        // the fresh parts' CPU lane and service thread first, still under the old part count: the lane's thread count
-        // follows it, and the shared pool is the survivors' only while the count agrees
-        for (Glm5Model* f : fresh) {
-            f->defer_lane_ = false;
-            if (!f->fast_setup_finish(e)) return false;
-        }
-        std::vector<Glm5Model*> now;
-        std::vector<int> devs;
-        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
-            now.push_back(m);
-            devs.push_back(m->dev_);
-        }
-        for (size_t i = 0; i < now.size(); ++i) {
-            Glm5Model* m = now[i];
-            m->n_parts_ = (int) now.size();
-            m->part_ = (int) i;
-            m->split_devs_ = devs;
-            m->calc_pf_state_ = 0;   // (the prompt path's pairings: decided again at the next prompt)
-            m->dual_pf_state_ = 0;
-            if (m->fast_ != nullptr) m->fast_->win.from = nullptr;   // (set again by the next pipelined window)
-        }
-        // the pipelined window's slot bank: every part flips its own at each window's begin and reads the previous
-        // part's rows at the slot ITS bank names, so the parts must agree - a fresh part starts at 0 while the
-        // survivors have flipped theirs as many times as windows ran (the first lend after an odd number of windows
-        // read the other bank's stale rows: garbage from the merged part on)
-        for (Glm5Model* f : fresh)
-            if (f->fast_ != nullptr && fast_ != nullptr) f->fast_->win.bank = fast_->win.bank;
-        int tmin = 0;
-        for (Glm5Model* m : now)
-            if (m->prefill_chunk() > 0) tmin = tmin == 0 ? m->prefill_chunk() : std::min(tmin, m->prefill_chunk());
-        if (tmin > 0)
-            for (Glm5Model* m : now) m->prefill_cap(tmin, "the split's smallest");
-        if (!dflash_bind(e)) return false;
-        for (Glm5Model* f : fresh)
-            if (!f->fast_helper_check(e)) return false;
-        cudaSetDevice(dev_);
-        return true;
-    };
     const auto fatal = [&](const std::string& what) {
         std::fprintf(stderr, "glm lend: FATAL: %s - layers [%d, %d) are gone and could not be loaded again: the engine "
-                             "ends\n", what.c_str(), spec_merged.l0, spec_merged.l1);
+                             "ends\n", what.c_str(), merged.l0, merged.l1);
         std::fflush(stderr);
         std::_Exit(1);
     };
     const auto t3 = clock::now();
-    std::unique_ptr<Glm5Model> np = make(spec_merged, devs_new);
+    std::unique_ptr<Glm5Model> np = resplit_make(merged, lo, old_n, devs_new);
     if (np == nullptr) {
         // the split as it was: both parts loaded again (the lent card still has its context)
         std::fprintf(stderr, "glm lend: CUDA%d the merged part did not load: the split is rebuilt as it was\n", ndev);
-        std::unique_ptr<Glm5Model> a = make(spec_lo, devs_old);
-        std::unique_ptr<Glm5Model> b = a != nullptr ? make(spec_hi, devs_old) : nullptr;
+        std::unique_ptr<Glm5Model> a = resplit_make(plan.lo, lo, old_n, devs_old);
+        std::unique_ptr<Glm5Model> b = a != nullptr ? resplit_make(plan.hi, lo + 1, old_n, devs_old) : nullptr;
         if (a == nullptr || b == nullptr) fatal("the rebuild failed too");
         Glm5Model* ap = a.get();
         Glm5Model* bp = b.get();
@@ -485,7 +554,7 @@ bool Glm5Model::lend_whole_run(const WholePlan& plan, std::string& err) {
         a->split_next_ = std::move(b);
         prev->split_next_ = std::move(a);
         std::string e;
-        if (!finish({ap, bp}, e)) fatal("the rebuilt split did not finish: " + e);
+        if (!resplit_finish({ap, bp}, e)) fatal("the rebuilt split did not finish: " + e);
         if (!have_state || !slot_load(slot, n_pos, e)) {
             reset();
             for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->snap_pos_ = -1;
@@ -502,7 +571,7 @@ bool Glm5Model::lend_whole_run(const WholePlan& plan, std::string& err) {
     prev->split_next_ = std::move(np);
     {
         std::string e;
-        if (!finish({npp}, e)) fatal("the new split did not finish: " + e);
+        if (!resplit_finish({npp}, e)) fatal("the new split did not finish: " + e);
     }
     const double t_link = ms_since(t4);
 
@@ -524,26 +593,212 @@ bool Glm5Model::lend_whole_run(const WholePlan& plan, std::string& err) {
 
     // ---- release: the lent card's primary context, and with it the process's presence on the card
     const auto t6 = clock::now();
-    cudaSetDevice(ldev);
-    const cudaError_t re = cudaDeviceReset();
-    cudaSetDevice(dev_);
-    if (re != cudaSuccess)
-        std::fprintf(stderr, "glm lend: CUDA%d cudaDeviceReset: %s (the process may still show on the card)\n", ldev,
-                     cudaGetErrorString(re));
+    leave_card(ldev, dev_);
     const double t_release = ms_since(t6);
 
-    std::string where;
-    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
-        where += (m == this ? "[" : ", [") + std::to_string(m->l0_) + ", " + std::to_string(m->l1_) + ") on CUDA" +
-                 std::to_string(m->dev_);
     const std::string state = have_state ? "the conversation state at " + std::to_string(n_pos) + " positions carried over"
                                          : "no conversation state to carry";
     std::fprintf(stderr, "glm lend: CUDA%d lent whole: CUDA%d now holds layers [%d, %d) (RAM tier %.2f GB); the split %s; "
                          "%s | quiet %.0f ms, save %.0f ms (%.1f MB), destroy %.0f ms, load %.0f ms, link %.0f ms, "
                          "restore %.0f ms, release %.0f ms, %.1f s in all\n",
-                 ldev, ndev, spec_merged.l0, spec_merged.l1, (double) npp->fast_->ram_bytes / 1073741824.0, where.c_str(),
-                 state.c_str(), t_quiet, t_save, (double) slot.size() / 1048576.0, t_destroy, t_load, t_link, t_restore,
-                 t_release, ms_since(t_all) / 1000.0);
+                 ldev, ndev, merged.l0, merged.l1, (double) npp->fast_->ram_bytes / 1073741824.0,
+                 resplit_where().c_str() + 7, state.c_str(), t_quiet, t_save, (double) slot.size() / 1048576.0,
+                 t_destroy, t_load, t_link, t_restore, t_release, ms_since(t_all) / 1000.0);
+    return true;
+}
+
+bool Glm5Model::lend_whole_room(const WholePlan& plan, std::string& why) {
+    int prev_dev = 0;
+    cudaGetDevice(&prev_dev);
+    cudaSetDevice(plan.dev);
+    size_t free_b = 0, total_b = 0;
+    const cudaError_t e = cudaMemGetInfo(&free_b, &total_b);   // (the primary context comes back for this)
+    const std::string card = "CUDA" + std::to_string(plan.dev);
+    if (e != cudaSuccess) {
+        cudaGetLastError();
+        why = card + " cudaMemGetInfo: " + cudaGetErrorString(e);
+        leave_card(plan.dev, prev_dev);
+        return false;
+    }
+    const uint64_t need = plan.mib << 20;
+    if ((uint64_t) free_b < need) {
+        // the context is in the card's used figure now; what is used beside it is another process's
+        why = card + " has " + mib(free_b) + " MiB free of " + mib(total_b) + " with this process's context up; the "
+              "part needs its footprint of " + mib(need) + " MiB back (short " + mib(need - free_b) + " MiB): another "
+              "process still holds the card";
+        leave_card(plan.dev, prev_dev);   // (the card as it was: the lease stays open, the process leaves again)
+        return false;
+    }
+    cudaSetDevice(prev_dev);
+    return true;
+}
+
+bool Glm5Model::lend_whole_return(const WholePlan& plan, std::string& err) {
+    using clock = std::chrono::steady_clock;
+    const auto t_all = clock::now();
+    const int ldev = plan.dev;
+    const int ndev = plan.lo.dev == ldev ? plan.hi.dev : plan.lo.dev;
+    const WholePlan::Part merged{ndev, std::min(plan.lo.l0, plan.hi.l0), std::max(plan.lo.l1, plan.hi.l1),
+                                 plan.lo.ram + plan.hi.ram};
+    std::vector<Glm5Model*> chain = chain_of(this);
+    int mi = -1;
+    for (size_t i = 0; i < chain.size(); ++i)
+        if (chain[i]->dev_ == ndev && chain[i]->l0_ == merged.l0 && chain[i]->l1_ == merged.l1) mi = (int) i;
+    int prev_dev = 0;
+    cudaGetDevice(&prev_dev);
+    struct DevBack {
+        int dev;
+        ~DevBack() { cudaSetDevice(dev); }
+    } dev_back{prev_dev};
+    if (mi < 1 || plan.lo.dev == plan.hi.dev || (plan.lo.dev != ldev && plan.hi.dev != ldev) ||
+        plan.n_parts != (int) chain.size() + 1) {
+        err = "glm lend: the return's plan does not fit the split (no merged part [" + std::to_string(merged.l0) + ", " +
+              std::to_string(merged.l1) + ") on CUDA" + std::to_string(ndev) + ")";
+        leave_card(ldev, dev_);
+        return false;
+    }
+    for (Glm5Model* m : chain) {
+        if (m->fast_ == nullptr) {
+            err = "glm lend: CUDA" + std::to_string(m->dev_) + " has no expert pool (the slow path)";
+            leave_card(ldev, dev_);
+            return false;
+        }
+        if (m->dev_ == ldev) {
+            err = "glm lend: CUDA" + std::to_string(ldev) + " holds a part of the split already";
+            return false;
+        }
+    }
+    Glm5Model* M = chain[(size_t) mi];
+    Glm5Model* prev = chain[(size_t) mi - 1];
+    Glm5Model* tail = chain.back();
+
+    // ---- quiet
+    Holds holds{chain};
+    if (!resplit_quiet(chain, err)) {
+        leave_card(ldev, dev_);
+        return false;
+    }
+    const double t_quiet = ms_since(t_all);
+
+    // ---- save
+    const auto t1 = clock::now();
+    std::vector<uint8_t> slot;
+    int64_t n_pos = -1;
+    bool have_state = snap_pos_ >= 0;
+    for (Glm5Model* m : chain) have_state = have_state && m->snap_pos_ == snap_pos_;
+    if (have_state) {
+        std::string e;
+        if (slot_save(slot, e) == 0) {
+            err = "glm lend: the conversation state did not save: " + e;
+            leave_card(ldev, dev_);
+            return false;
+        }
+        n_pos = snap_pos_;
+    }
+    const double t_save = ms_since(t1);
+
+    // the device lists: the split as it is (the rebuild's) and as it was (the two parts')
+    std::vector<int> devs_now, devs_was;
+    for (Glm5Model* m : chain) {
+        devs_now.push_back(m->dev_);
+        if (m == M) {
+            devs_was.push_back(plan.lo.dev);
+            devs_was.push_back(plan.hi.dev);
+        } else {
+            devs_was.push_back(m->dev_);
+        }
+    }
+    if (tail->head_helper_ == M) tail->head_helper_ = nullptr;
+
+    // ---- destroy: the merged part out of the chain
+    const auto t2 = clock::now();
+    holds.drop(M);
+    std::unique_ptr<Glm5Model> mp = std::move(prev->split_next_);
+    std::unique_ptr<Glm5Model> rest = std::move(mp->split_next_);
+    mp.reset();
+    M = nullptr;
+    const double t_destroy = ms_since(t2);
+
+    // ---- load: the two parts as they were, the earlier first (the lent card's context comes back with its first
+    //      allocation)
+    const auto fatal = [&](const std::string& what) {
+        std::fprintf(stderr, "glm lend: FATAL: %s - layers [%d, %d) are gone and could not be loaded again: the engine "
+                             "ends\n", what.c_str(), merged.l0, merged.l1);
+        std::fflush(stderr);
+        std::_Exit(1);
+    };
+    const auto t3 = clock::now();
+    std::unique_ptr<Glm5Model> a = resplit_make(plan.lo, mi, plan.n_parts, devs_was);
+    std::unique_ptr<Glm5Model> b = a != nullptr ? resplit_make(plan.hi, mi + 1, plan.n_parts, devs_was) : nullptr;
+    if (a == nullptr || b == nullptr) {
+        // the merged part again: the lease stays open
+        a.reset();
+        std::fprintf(stderr, "glm lend: CUDA%d a part did not load again: the merged part is rebuilt on CUDA%d\n", ldev,
+                     ndev);
+        std::unique_ptr<Glm5Model> np = resplit_make(merged, mi, plan.n_parts, devs_now);
+        if (np == nullptr) fatal("the rebuild failed too");
+        Glm5Model* npp = np.get();
+        np->split_next_ = std::move(rest);
+        prev->split_next_ = std::move(np);
+        std::string e;
+        if (!resplit_finish({npp}, e)) fatal("the rebuilt merged split did not finish: " + e);
+        if (!have_state || !slot_load(slot, n_pos, e)) {
+            reset();
+            for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->snap_pos_ = -1;
+        }
+        leave_card(ldev, dev_);
+        err = "glm lend: CUDA" + std::to_string(ldev) + " a part did not load again; the merged split stands and the "
+              "lease stays open";
+        return false;
+    }
+    const double t_load = ms_since(t3);
+
+    // ---- link
+    const auto t4 = clock::now();
+    Glm5Model* ap = a.get();
+    Glm5Model* bp = b.get();
+    b->split_next_ = std::move(rest);
+    a->split_next_ = std::move(b);
+    prev->split_next_ = std::move(a);
+    {
+        std::string e;
+        if (!resplit_finish({ap, bp}, e)) fatal("the returned split did not finish: " + e);
+    }
+    const double t_link = ms_since(t4);
+
+    // ---- restore
+    const auto t5 = clock::now();
+    if (have_state) {
+        std::string e;
+        if (!slot_load(slot, n_pos, e)) {
+            std::fprintf(stderr, "glm lend: the conversation state did not load back onto the returned split (%s): the "
+                                 "next request reads its prompt again\n", e.c_str());
+            reset();
+            for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->snap_pos_ = -1;
+        }
+    } else {
+        reset();
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->snap_pos_ = -1;
+    }
+    const double t_restore = ms_since(t5);
+
+    // ---- check: the load's room check again for the card, so it may be lent whole again (whole_mib(dev) set anew)
+    const auto t6 = clock::now();
+    lend_whole_check({ldev});
+    const double t_check = ms_since(t6);
+
+    const Glm5Model* lp = plan.lo.dev == ldev ? ap : bp;
+    const Glm5Model* op = plan.lo.dev == ldev ? bp : ap;
+    const std::string state = have_state ? "the conversation state at " + std::to_string(n_pos) + " positions carried over"
+                                         : "no conversation state to carry";
+    std::fprintf(stderr, "glm lend: CUDA%d returned: it holds layers [%d, %d) again (RAM tier %.2f GB), CUDA%d layers "
+                         "[%d, %d) (RAM tier %.2f GB), whole-lendable %s; the split %s; %s | quiet %.0f ms, save %.0f ms "
+                         "(%.1f MB), destroy %.0f ms, load %.0f ms, link %.0f ms, restore %.0f ms, check %.0f ms, %.1f s "
+                         "in all\n",
+                 ldev, lp->l0_, lp->l1_, (double) lp->fast_->ram_bytes / 1073741824.0, op->dev_, op->l0_, op->l1_,
+                 (double) op->fast_->ram_bytes / 1073741824.0, whole_mib(ldev) > 0 ? "again" : "NOT (see above)",
+                 resplit_where().c_str() + 7, state.c_str(), t_quiet, t_save, (double) slot.size() / 1048576.0,
+                 t_destroy, t_load, t_link, t_restore, t_check, ms_since(t_all) / 1000.0);
     return true;
 }
 

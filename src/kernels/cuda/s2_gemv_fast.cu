@@ -27,6 +27,7 @@
 // reference like every other one - being faster is never a reason to be trusted, and being neutral is not
 // either.
 #include "strata/kernels/s_gemv.hpp"
+#include "strata/kernels/glm_fast.hpp"   // (glmf::DevGen: the __constant__ upload below is the context's)
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -44,11 +45,13 @@ constexpr int MAX_SHARED_HALVES = 4096;      // 8 KB of shared for x; n_embd 256
 __constant__ float c_codes[256][4];
 
 bool g_lut_ready[64] = {};   // per device: __constant__ memory is per device (a layer split runs on two)
+glmf::DevGen g_lut_gen;      // ... and per context: uploaded again on a new one
 
 void ensure_lut() {
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev < 0 || dev >= 64) dev = 0;
+    if (!g_lut_gen.keep(dev)) g_lut_ready[dev] = false;
     if (g_lut_ready[dev]) return;
     float host[256][4];
     for (int b = 0; b < 256; ++b) {

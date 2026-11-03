@@ -1,5 +1,6 @@
 // src/kernels/cuda/qsa_prompt_attn.cu - see include/strata/kernels/qsa_prompt_attn.hpp.
 #include "strata/kernels/qsa_prompt_attn.hpp"
+#include "strata/kernels/glm_fast.hpp"   // (glmf::DevGen: the per-device opt-ins below are the context's)
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
 
@@ -614,10 +615,12 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_i8_kernel(const float* __
 bool launch_i8(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
                const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
     static bool attr[64] = {};   // the shared-memory opt-in is per device (a layer split runs this on several)
+    static glmf::DevGen gen;     // ... and per context: set again on a new one
     int dev = 0;
     cudaGetDevice(&dev);
     const int bytes = (int) sizeof(Smem2);
     if (dev < 0 || dev >= 64) return false;
+    if (!gen.keep(dev)) attr[dev] = false;
     if (!attr[dev]) {
         if (cudaFuncSetAttribute(prompt_attn_i8_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) !=
             cudaSuccess) {
@@ -645,10 +648,12 @@ template <int KV_MODE>
 bool launch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
             const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
     static bool attr[64] = {};   // per device, as above
+    static glmf::DevGen gen;
     int dev = 0;
     cudaGetDevice(&dev);
     const int bytes = (int) sizeof(Smem<KV_MODE>);
     if (dev < 0 || dev >= 64) return false;
+    if (!gen.keep(dev)) attr[dev] = false;
     if (!attr[dev]) {
         if (cudaFuncSetAttribute(prompt_attn_kernel<KV_MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) !=
             cudaSuccess) {

@@ -41,6 +41,7 @@
 //    BIT-EXACT assertion plus a full-precision probe of the intermediate found it.  That is the strongest
 //    argument in this file for keeping both.
 #include "strata/kernels/qsa.hpp"
+#include "strata/kernels/glm_fast.hpp"   // (glmf::DevGen: the per-device opt-in below is the context's)
 
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/kv_stream.hpp"
@@ -658,9 +659,11 @@ void qsa_attend_step(const float* q, const uint16_t* k_scratch, const uint16_t* 
     const size_t smem = (size_t) (max_ids + 32) * sizeof(float);
     // per DEVICE: the opt-in is a device setting (a layer split runs this on two cards)
     static size_t s_configured_dev[64] = {};
+    static glmf::DevGen gen;   // (set again on a new context)
     int cur_dev = 0;
     cudaGetDevice(&cur_dev);
     size_t& s_configured = s_configured_dev[(cur_dev >= 0 && cur_dev < 64) ? cur_dev : 0];
+    if (!gen.keep(cur_dev)) s_configured = 0;
     if (smem > s_configured) {
         int dev = 0, max_shared = 0;
         cudaGetDevice(&dev);

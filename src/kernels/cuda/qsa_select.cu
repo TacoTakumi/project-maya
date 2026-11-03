@@ -1,5 +1,6 @@
 // src/kernels/cuda/qsa_select.cu - see include/strata/kernels/qsa_select.hpp.
 #include "strata/kernels/qsa_select.hpp"
+#include "strata/kernels/glm_fast.hpp"   // (glmf::DevGen: the per-device opt-in below is the context's)
 
 #include <cuda_runtime.h>
 
@@ -469,9 +470,12 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
     return false;   // the tensor-core kernel is compiled out on AMD (its major version is not a CUDA sm)
 #endif
     static bool attr[64] = {};   // the shared-memory opt-in is per device (a layer split runs it on several)
+    static glmf::DevGen gen;     // ... and per context: set again on a new one
     int adev = 0;
     cudaGetDevice(&adev);
     const int bytes = (TC_QT * TC_QS + TC_NB * TC_KS) * (int) sizeof(float);
+    if (adev < 0 || adev >= 64) return false;
+    if (!gen.keep(adev)) attr[adev] = false;
     if (!attr[adev]) {
         if (cudaFuncSetAttribute(block_scores_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) !=
             cudaSuccess) {

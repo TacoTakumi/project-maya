@@ -47,8 +47,17 @@
 // card has no footprint now, or a POOL lease is open on the card or on the neighbour that would take its layers (the
 // lease holds the part's blocks: the part cannot go).  The handler already refuses a card with any lease open on it.
 // A whole-card lease's token is the lender's own, like a pool lease's; while it is open the card stays in lend_cards()
-// with nothing to lend (block 0), so LENDABLE lists it and a LEND on it answers ERR MAX 0.  Its RETURN is not here yet:
-// give_back on a whole-card token answers busy (the lease stays open) and says so once in the log.
+// with nothing to lend (block 0), so LENDABLE lists it and a LEND on it answers ERR MAX 0.  The lease keeps the plan
+// the lend ran with (the two parts as they were: devices, layers, RAM tier budgets, and the load's part count).
+//
+// THE RETURN of a whole-card lease (give_back on its token): first the room check, Glm5Model::lend_whole_room - the
+// lent card's free VRAM against the footprint the part had; short of it (another process still holds the card) the
+// answer is busy with the figures in one log line, nothing changes and the lease stays open (RETURN answers ERR BUSY,
+// the server 409 retry).  Busy too while a pool lease holds blocks of the merged part (its pool would go with it).
+// Then Glm5Model::lend_whole_return splits the merged part back into the two parts as they were (glm_resplit.cu: the
+// lend's phases in reverse, the state carried both ways), and the load's room check runs again for the card, so its
+// footprint is announced again (LENDABLE whole=).  A part that did not load again leaves the merged split standing,
+// rebuilt: busy, the lease open, the next RETURN tries again.
 //
 // When to call: see make_glm_lender in glm_model.hpp - from the engine's command loop, with nothing in flight.
 #include "glm_fast_state.hpp"
@@ -625,7 +634,13 @@ public:
         }
         cudaSetDevice(prev);
         const uint64_t token = next_++;
-        whole_.push_back({dev, at, (size_t) plan.mib, token});
+        Whole w;
+        w.dev = dev;
+        w.at = at;
+        w.token = token;
+        w.plan = plan;
+        w.plan.lent = w.plan.into = nullptr;   // (both parts are gone: the plan's figures are what the return uses)
+        whole_.push_back(std::move(w));
         r.ok = true;
         r.mib = (size_t) plan.mib;
         r.token = token;
@@ -633,12 +648,8 @@ public:
     }
 
     GiveBack give_back(int dev, uint64_t token) override {
-        for (const Whole& w : whole_)
-            if (w.token == token) {
-                std::fprintf(stderr, "glm lend: CUDA%d the return of a whole-card lease is not here yet: lease %llu stays "
-                                     "open\n", dev, (unsigned long long) token);
-                return GiveBack::busy;
-            }
+        for (auto w = whole_.begin(); w != whole_.end(); ++w)
+            if (w->token == token) return give_back_whole(w);
         const auto it = leases_.find(token);
         if (it == leases_.end()) return GiveBack::returned;   // (never lent by this lender: nothing to put back)
         int prev = 0;
@@ -670,10 +681,49 @@ private:
     };
     struct Whole {   // a whole-card lease: the card's part is gone
         int dev = 0;
-        int at = 0;       // where the card stood in the chain's card order (lend_cards keeps listing it there)
-        size_t mib = 0;   // the footprint released
+        int at = 0;   // where the card stood in the chain's card order (lend_cards keeps listing it there)
         uint64_t token = 0;
+        Glm5Model::WholePlan plan;   // what the lend ran with: the footprint (mib) and the two parts the return reloads
     };
+
+    // the return of a whole-card lease (see the top): the room check, then the re-split back; the lease is dropped on
+    // RETURNED only
+    GiveBack give_back_whole(std::vector<Whole>::iterator w) {
+        const int dev = w->dev;
+        const unsigned long long token = w->token;
+        // a pool lease on the merged part holds blocks of the pool that would go with it
+        const int ndev = w->plan.lo.dev == dev ? w->plan.hi.dev : w->plan.lo.dev;
+        for (const auto& [t, L] : leases_)
+            for (const auto& s : L.sets)
+                if (s.first->dev_ == ndev) {
+                    std::fprintf(stderr, "glm lend: CUDA%d the return of lease %llu waits: lease %llu holds %zu blocks of "
+                                         "CUDA%d's pool (layers [%d,%d)), the merged part that would split back\n", dev,
+                                 token, (unsigned long long) t, s.second.size(), ndev, s.first->l0_, s.first->l1_);
+                    return GiveBack::busy;
+                }
+        int prev = 0;
+        cudaGetDevice(&prev);
+        std::string why;
+        if (!head_.lend_whole_room(w->plan, why)) {
+            std::fprintf(stderr, "glm lend: CUDA%d the return of lease %llu waits: %s\n", dev, token, why.c_str());
+            cudaSetDevice(prev);
+            return GiveBack::busy;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        std::string err;
+        if (!head_.lend_whole_return(w->plan, err)) {
+            std::fprintf(stderr, "glm lend: CUDA%d the return of lease %llu waits: %s\n", dev, token, err.c_str());
+            cudaSetDevice(prev);
+            return GiveBack::busy;
+        }
+        cudaSetDevice(prev);
+        std::fprintf(stderr, "glm lend: CUDA%d lease %llu returned: the card holds its part again (%zu MiB footprint "
+                             "announced %llu MiB), %.1f s\n", dev, token, (size_t) w->plan.mib,
+                     (unsigned long long) head_.whole_mib(dev),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        whole_.erase(w);
+        return GiveBack::returned;
+    }
 
     // the cards in the chain's order, a card lent whole kept at its place with nothing to lend
     std::vector<Card> cards() {
