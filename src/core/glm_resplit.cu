@@ -777,7 +777,19 @@ bool Glm5Model::lend_whole_run(const WholePlan& plan, std::string& err) {
         std::_Exit(1);
     };
     const auto t3 = clock::now();
-    std::unique_ptr<Glm5Model> np = resplit_make(merged, lo, old_n, devs_new);
+    std::unique_ptr<Glm5Model> np;
+    // a TEST FAULT, STRATA_GLM_RESPLIT_FAIL_LOAD=1: the first merged load of the process fails right here, before
+    // resplit_make - as early as a real failure could, the two parts gone - so the rebuild below runs; it is spent
+    // after that one use, the next lend loads as always
+    static bool fail_load_spent = false;
+    const char* fail_load = std::getenv("STRATA_GLM_RESPLIT_FAIL_LOAD");
+    if (!fail_load_spent && fail_load != nullptr && std::atoi(fail_load) != 0) {
+        fail_load_spent = true;
+        std::fprintf(stderr, "glm lend: TEST FAULT (STRATA_GLM_RESPLIT_FAIL_LOAD): the merged load of layers [%d, %d) on "
+                             "CUDA%d is made to fail, once\n", merged.l0, merged.l1, ndev);
+    } else {
+        np = resplit_make(merged, lo, old_n, devs_new);
+    }
     if (np == nullptr) {
         // the split as it was: both parts loaded again (the lent card still has its context)
         std::fprintf(stderr, "glm lend: CUDA%d the merged part did not load: the split is rebuilt as it was\n", ndev);
@@ -791,10 +803,18 @@ bool Glm5Model::lend_whole_run(const WholePlan& plan, std::string& err) {
         prev->split_next_ = std::move(a);
         std::string e;
         if (!resplit_finish({ap, bp}, e)) fatal("the rebuilt split did not finish: " + e);
-        if (!have_state || !resplit_state_load(st, e)) {
+        const bool restored = have_state && resplit_state_load(st, e);
+        if (!restored) {
             reset();
             for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->snap_pos_ = -1;
         }
+        // the load's room check again for the lent card, as the return runs it: the rebuilt part is a fresh model
+        // (whole_mib_ 0), and without the check the card would stay un-lendable whole until a restart
+        lend_whole_check({ldev});
+        std::fprintf(stderr, "glm lend: CUDA%d rebuilt after the failed lend: whole-lendable %s; the split %s; %s\n", ldev,
+                     whole_mib(ldev) > 0 ? "again" : "NOT (see above)", resplit_where().c_str() + 7,
+                     restored ? resplit_state_words(st).c_str()
+                              : "no conversation state carried (the next request reads its prompt again)");
         err = "glm lend: CUDA" + std::to_string(ldev) + " the merged part did not load; the split is as it was";
         return false;
     }

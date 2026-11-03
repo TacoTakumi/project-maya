@@ -1282,4 +1282,9 @@ ResplitRoom resplit_room(const std::vector<ResplitPart>& parts, int dev, uint64_
 /// command line.  None of the three is safe from another thread.
 std::unique_ptr<VramLender> make_glm_lender(Glm5Model& head);
 
+/// One whole-card lease at a time (src/core/glm_lend.cu, the whole-card section says why): true when a whole-card lend
+/// may run and a card's footprint is announced (the lender's whole_mib), given the whole-card leases open now.  The
+/// lender's rule on its own, so a test reaches it without a model.
+bool glm_whole_lend_allowed(size_t open_whole);
+
 }  // namespace strata::core

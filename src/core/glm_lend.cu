@@ -50,6 +50,13 @@
 // with nothing to lend (block 0), so LENDABLE lists it and a LEND on it answers ERR MAX 0.  The lease keeps the plan
 // the lend ran with (the two parts as they were: devices, layers, RAM tier budgets, and the load's part count).
 //
+// ONE WHOLE-CARD LEASE AT A TIME (glm_whole_lend_allowed, glm_model.hpp).  While a whole-card lease is open the lender
+// refuses a whole lend of ANY other card (one log line), and whole_mib() answers 0 for every card, so the LENDABLE
+// lines show whole=0 across the board until the lease returns (the handler and the server refuse on that figure, the
+// lender refuses on its own too).  A second merged part would load under the load's part count less one (a second
+// CPU-lane pool opens), and the first lease's return would answer busy until the second returned - two borrowers
+// returning in order would never complete.  Several cards in --lend-whole can each be lent whole, one after the other.
+//
 // THE RETURN of a whole-card lease (give_back on its token): first the room check, Glm5Model::lend_whole_room - the
 // lent card's free VRAM against the footprint the part had; short of it (another process still holds the card) the
 // answer is busy with the figures in one log line, nothing changes and the lease stays open (RETURN answers ERR BUSY,
@@ -590,8 +597,9 @@ public:
     }
 
     size_t whole_mib(int dev) override {
-        for (const Whole& w : whole_)
-            if (w.dev == dev) return 0;   // (its lease is open: the part is gone)
+        // one whole-card lease at a time (the top of the file): while one is open no card has a footprint - the lent
+        // card's part is gone, and another card's lend is refused (lend_whole), so its footprint is not announced
+        if (!glm_whole_lend_allowed(whole_.size())) return 0;
         return (size_t) head_.whole_mib(dev);
     }
 
@@ -603,6 +611,13 @@ public:
         for (const Card& k : cards())
             if (k.dev == dev)
                 for (Glm5Model* m : k.parts) r.max_mib += (size_t) part_lendable(*m).blocks * (k.block >> 20);
+        // one whole-card lease at a time (the top of the file)
+        if (!glm_whole_lend_allowed(whole_.size())) {
+            std::fprintf(stderr, "glm lend: CUDA%d is not lent whole while lease %llu holds CUDA%d whole: one whole-card "
+                                 "lease at a time\n", dev, (unsigned long long) whole_.front().token, whole_.front().dev);
+            cudaSetDevice(prev);
+            return r;
+        }
         Glm5Model::WholePlan plan;
         std::string err;
         if (!head_.lend_whole_plan(dev, plan, err)) {
@@ -781,5 +796,7 @@ private:
 }  // namespace
 
 std::unique_ptr<VramLender> make_glm_lender(Glm5Model& head) { return std::make_unique<GlmLender>(head); }
+
+bool glm_whole_lend_allowed(size_t open_whole) { return open_whole == 0; }
 
 }  // namespace strata::core
