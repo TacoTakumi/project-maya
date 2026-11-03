@@ -483,6 +483,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(vram_pool_test PRIVATE strata_core ${_strata_gpu_runtime_target})
     add_test(NAME vram_pool_test COMMAND vram_pool_test)
     set_tests_properties(vram_pool_test PROPERTIES TIMEOUT 120)
+    # one device's context released while another keeps running: pinned host memory registered under the released
+    # device, NVML baseline with no PID after the reset, 20 cycles with RSS (needs two GPUs with ~1 GiB free, no model;
+    # STRATA_TEST_DEV picks the released card, the next device is the one that keeps running; skips with one GPU)
+    add_executable(vram_ctx_release_test tests/vram_ctx_release_test.cu)
+    target_link_libraries(vram_ctx_release_test PRIVATE ${_strata_gpu_runtime_target} CUDA::nvml)
+    add_test(NAME vram_ctx_release_test COMMAND vram_ctx_release_test)
+    set_tests_properties(vram_ctx_release_test PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     # DeepSeek's lend of that pool (src/ds4/ds4_lend.cu): the block choice, the slot tables, and the lender over a real
     # pool and a made-up cache (needs a GPU with ~2 GiB free, no model; STRATA_TEST_DEV picks the card)
     add_executable(ds4_lend_test tests/ds4_lend_test.cu src/ds4/ds4_lend.cu)
