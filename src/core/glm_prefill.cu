@@ -1649,6 +1649,12 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
     // background moves in flight land first and no new ones start (fast_boundary step 5): a slot with a copy on its
     // way would otherwise be lent under it
     F->bg_hold = true;
+    // ... and off again on every return, the early ones too (a failed sync or boundary once left it on, and the decode
+    // never promoted again): the same guard as lend_part's
+    struct Hold {
+        FastState* F;
+        ~Hold() { F->bg_hold = false; }
+    } hold{F};
     // Retire metadata as well as DMA. With the hold set, the boundary cannot start replacement moves.
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm lending copies", err) || !fast_boundary(err))
         return false;
@@ -1817,8 +1823,7 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
         if (!ok) return false;
         F->check_resident(l0_, lt_, NE);   // (a lent slot's expert left VRAM: the decode's routes wait and fetch again)
     }
-    F->bg_hold = false;
-    return true;
+    return true;   // (hold: bg_hold off)
 }
 
 // ... and back: the slots are free again; the decode's boundaries hand them out as spares (misses refill them)
