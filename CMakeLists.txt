@@ -640,6 +640,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(glm_lend_test PRIVATE strata_engine ${_strata_gpu_runtime_target})
     add_test(NAME glm_lend_test COMMAND glm_lend_test)
     set_tests_properties(glm_lend_test PROPERTIES TIMEOUT 120)
+    # a conversation slot's sections against a live split that differs from the one that saved it (a card lent whole
+    # merges two parts): Glm5SlotLayout over made-up records - no model, no GPU; the header needs the toolkit's headers
+    add_executable(glm_slot_test tests/glm_slot_test.cu)
+    target_include_directories(glm_slot_test PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(glm_slot_test PRIVATE strata_engine ${_strata_gpu_runtime_target})
+    add_test(NAME glm_slot_test COMMAND glm_slot_test)
+    set_tests_properties(glm_slot_test PROPERTIES TIMEOUT 60)
   endif()
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/file_expert_source_test.cpp")
     enable_testing()

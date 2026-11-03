@@ -93,6 +93,60 @@ struct Glm5Geometry {
     static bool from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
 };
 
+/// A conversation slot's layout (Glm5Model::slot_save / slot_load, src/core/glm_fast_path.cu) against the live layer
+/// split, with no model and no GPU behind it, so the mapping can be checked on made-up bytes (tests/glm_slot_test).
+/// A slot is a head (magic, the sections, the positions), then one SECTION per part of the split that saved it: a
+/// header (its layer range, its recurrent layers, its DSA runs, a KDA record's floats, each run's floats) and a
+/// payload (the KDA records in layer order, then each DSA layer's two closed-pool records, then each DSA layer's
+/// latents and open pool; the NextN block counts as the DSA layer n_layers and comes first among a section's DSA
+/// layers).  The split that loads a slot may differ from the one that saved it - a card lent whole merges its part
+/// into the neighbour's, the return splits them again - so each live part takes every record of its layers from
+/// whichever section saved that layer.  The format is unchanged: the mapping derives everything from the headers.
+struct Glm5SlotLayout {
+    static constexpr uint64_t kMagic = 0x3254534C4159414Dull;   // "MAYALST2" (v2: the ik / ig ring's open pool only)
+    static constexpr uint64_t kHeadBytes = 8 + 4 + 8;
+    struct Section {                      // one saved part, as its header says
+        int l0 = 0, l1 = 0;
+        int32_t n_rec = 0;                // its recurrent layers
+        int64_t run = 0;                  // a KDA record's floats
+        std::vector<int64_t> run_len;     // its DSA runs' floats, in file order (latents, open pool per DSA layer)
+        uint64_t payload = 0, bytes = 0;  // its payload's offset in the slot, and its size
+    };
+    struct Part {                         // one live part
+        int l0 = 0, l1 = 0;
+        bool mtp = false;                 // carries the NextN block
+    };
+    struct Sizes {                        // the live model's record sizes, in floats
+        int64_t run = 0;                  // a KDA layer's state and conv history
+        int64_t pool_rec = 0;             // a DSA layer's two closed-pool records (2 * (kpool - 1) * key)
+        int64_t lat = 0;                  // a DSA layer's latents over the slot's positions
+        int64_t pool = 0;                 // a DSA layer's open pool over the slot's positions
+    };
+    struct Piece {                        // one record of a live part's payload
+        int sec = -1;                     // the section it comes from
+        uint64_t at = 0;                  // its byte offset in the slot
+        int64_t floats = 0;
+    };
+    /// Reads `bytes` at offset `at` of the slot into p; false past its end.
+    using Read = std::function<bool(uint64_t at, void* p, size_t bytes)>;
+    /// The writer's bytes: the head, and one section's header (its payload follows).
+    static std::vector<uint8_t> head(uint32_t n_sections, int64_t n_pos);
+    static std::vector<uint8_t> section_header(int l0, int l1, int32_t n_rec, int64_t run,
+                                               const std::vector<int64_t>& run_len);
+    /// The head and every section header of a slot of `size` bytes, through `read`; pool_rec sizes the closed-pool
+    /// block, which the header does not spell out.  False + err: the magic, a truncated slot (and where), an odd run
+    /// count.
+    static bool parse(const Read& read, uint64_t size, int64_t pool_rec, std::vector<Section>& secs, int64_t& n_pos,
+                      std::string& err);
+    /// Each live part's payload records in slot_load's order (its KDA records, then its DSA layers' closed pools,
+    /// then their latents and open pools, the NextN block first among the DSA layers), each pointed at the section
+    /// that saved that layer.  recr[il] marks a recurrent layer; recr.size() is the model's layer count and the NextN
+    /// block's index.  False + err: a layer no section holds (the layer named), a section whose ranges, counts or
+    /// record sizes are another model's.
+    static bool map(const std::vector<Section>& secs, const std::vector<Part>& parts, const std::vector<bool>& recr,
+                    const Sizes& sz, std::vector<std::vector<Piece>>& pieces, std::string& err);
+};
+
 class Glm5Model {
 public:
     Glm5Model() = default;
@@ -619,6 +673,11 @@ public:
     void kv_stream_reset_maps();                             // nothing resident (reset, slot_load)
     float* snap_pool_ = nullptr;
     std::vector<int> dsa_layers() const;                   // this half's DSA layers (NextN block first), slot order
+    // both slot_load forms: the slot's headers through `read`, each record's floats through `copy` (slot offset ->
+    // the live part's memory), every section mapped onto the live parts whatever split saved it
+    using SlotCopy = std::function<bool(uint64_t at, float* dst, int64_t floats)>;
+    bool slot_load_from(const Glm5SlotLayout::Read& read, uint64_t size, const SlotCopy& copy, int64_t n_pos,
+                        std::string& err);
     void snap_pool_copy(bool restore);
     int64_t snap_pos_ = -1;
     std::vector<std::vector<float>> ckpt_buf_;             // ckpt_save's checkpoints (this half): KDA runs, pool rows
