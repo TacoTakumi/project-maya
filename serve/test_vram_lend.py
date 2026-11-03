@@ -30,8 +30,9 @@ ROOT = Path(__file__).resolve().parents[1]
 # is open its lendable and whole= are 0.  FAKE_LEND=0: an engine without lending (the "unsupported command" ERR);
 # FAKE_MULTI=<n>: several conversations (READY ... multi=<n>, the lines tagged with rid); FAKE_BUSY=<n>: the first n
 # RETURNs answer ERR BUSY; FAKE_SLOW=<n>: the first n LENDs are answered late, by FAKE_SLOW_S seconds (1.2; the command
-# loop waits, as an engine's does while it reads a long prompt: the commands behind them wait too); FAKE_LOG: every
-# line it reads, one a line.
+# loop waits, as an engine's does while it reads a long prompt: the commands behind them wait too); FAKE_SLOW_RETURN=<n>:
+# the first n RETURNs are answered late, by FAKE_SLOW_RETURN_S seconds (FAKE_SLOW_S; an engine reloads its parts on a
+# whole-card return); FAKE_LOG: every line it reads, one a line.
 STAND_IN = r'''
 import os, re, sys, threading, time
 
@@ -40,6 +41,8 @@ multi = int(os.environ.get("FAKE_MULTI", "0") or 0)
 busy = [int(os.environ.get("FAKE_BUSY", "0") or 0)]
 slow = [int(os.environ.get("FAKE_SLOW", "0") or 0)]
 slow_s = float(os.environ.get("FAKE_SLOW_S", "1.2") or 1.2)
+slow_return = [int(os.environ.get("FAKE_SLOW_RETURN", "0") or 0)]
+slow_return_s = float(os.environ.get("FAKE_SLOW_RETURN_S", "") or slow_s)
 log = os.environ.get("FAKE_LOG")
 pool = {0: 4096, 1: 2048}                            # dev -> what it can lend with nothing out (MiB)
 whole = {1: 15360}                                   # dev -> its whole-card footprint (absent: not whole-lendable)
@@ -142,6 +145,9 @@ for line in sys.stdin:
         if f[0] == "LEND" and slow[0] > 0:
             slow[0] -= 1
             time.sleep(slow_s)
+        if f[0] == "RETURN" and slow_return[0] > 0:
+            slow_return[0] -= 1
+            time.sleep(slow_return_s)
         for a in lend_cmd(f):
             out(a)
         continue
@@ -609,6 +615,51 @@ class LateWholeAnswers(LendBase):
         self.assertEqual((vram_lend.POOL_WAIT_S, vram_lend.WHOLE_WAIT_S), (30.0, 180.0))
         lender = vram_lend.Lender()
         self.assertEqual((lender.answer_s, lender.whole_answer_s), (30.0, 180.0))
+
+
+class LateReturns(LendBase):
+    """The engine answers a RETURN "45 s" late (a whole-card return reloads the GPU's part: 26-27 s measured on a warm
+    page cache, longer cold): past a pool lease's 30 s wait (503, and the lease still goes when the answer comes) but
+    inside a whole-card lease's 180 s (200).  Scaled as LateWholeAnswers: the stand-in answers after 1.2 s, the waits
+    are 0.8 s and 4.8 s."""
+    env = {"FAKE_SLOW_RETURN": "1", "FAKE_SLOW_RETURN_S": "1.2"}
+
+    def setUp(self):
+        super().setUp()
+        self.svc.vram_lend.answer_s = 0.8
+        self.svc.vram_lend.whole_answer_s = 4.8
+
+    def gone(self):
+        end = time.monotonic() + 10
+        while time.monotonic() < end:
+            if not self.state()["leases"]:
+                return
+            time.sleep(0.05)
+        self.fail(f"the lease did not go: {self.engine_lines('RETURN')}, {self.state()}")
+
+    def test_a_whole_card_return_answered_at_45_s_is_200(self):
+        code, lease = self.lend("0000:0a:00.0", "all")
+        self.assertEqual(code, 200, lease)
+        t0 = time.monotonic()
+        code, out = self.give_back(lease["id"])
+        self.assertEqual(code, 200, out)
+        self.assertGreater(time.monotonic() - t0, 1.0)
+        self.assertEqual(out, lease)
+        self.assertEqual(self.engine_lines("RETURN"), ["RETURN 7"])
+        st = self.state()
+        self.assertEqual(st["leases"], [])
+        self.assertEqual(self.gpu(st, "0000:0a:00.0"),
+                         {"gpu": "0000:0a:00.0", "lendable": 2048, "lent": 0, "whole_mib": 15360})
+
+    def test_a_pool_return_answered_at_45_s_is_503_and_the_lease_still_goes(self):
+        code, lease = self.lend("0000:01:00.0", 64)
+        self.assertEqual(code, 200, lease)
+        code, out = self.give_back(lease["id"])
+        self.assertEqual(code, 503, out)
+        self.assertIn("did not answer", out["error"])
+        self.gone()
+        self.assertEqual(self.engine_lines("RETURN"), ["RETURN 7"])
+        self.assertEqual(self.gpu(self.state(), "0000:01:00.0"), {"gpu": "0000:01:00.0", "lendable": 4096, "lent": 0})
 
 
 class WhileRequestsRun(LendBase):
