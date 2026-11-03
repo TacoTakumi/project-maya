@@ -9,17 +9,29 @@
 //       -> LENT <id> <dev> <mib>    the lease, with the MiB actually lent
 //       -> ERR MAX <mib>            more than the card can lend; <mib> is what it can lend now
 //       -> ERR NODEV <dev>          <dev> is not a card that lends (well formed, no such card)
-//   RETURN <id>         give a lease's memory back to the cache
+//   LEND <dev> ALL      lend the whole card: its part is destroyed, so the card is free for another process
+//       -> LENT <id> <dev> <mib>    the lease, with the footprint released
+//       -> ERR MAX <mib>            the card is not whole-lendable (no footprint), or a lease is open on it already;
+//                                   <mib> is what its pool can lend now
+//       -> ERR NODEV <dev>          as for LEND <dev> <mib>
+//   RETURN <id>         give a lease's memory back to the cache (a whole-card lease too)
 //       -> RETURNED <id>
 //       -> ERR BUSY <id>            someone still holds the memory: the lease stays open, try again later
 //       -> ERR UNKNOWN <id>         no open lease has that id (never handed out, or already returned)
 //   LENDABLE            what each card can lend now and what it has out
-//       -> LENDABLE dev=<n> lendable=<mib> lent=<mib>    one line per card, in the engine's order
+//       -> LENDABLE dev=<n> lendable=<mib> lent=<mib> whole=<mib>    one line per card, in the engine's order;
+//                                   whole= is the card's whole-card footprint, 0 when it is not whole-lendable and
+//                                   while its whole-card lease is open
 //       -> END
+//
+// The two kinds of lease never share a card: while a whole-card lease is open on a card, its lendable is 0 and a LEND
+// of either kind on it answers ERR MAX 0; while a pool lease is open on a card, LEND <dev> ALL answers ERR MAX with
+// the pool's lendable.
 //
 // A lend command that does not parse is answered, never passed on to the engine's other commands:
 //       -> ERR MALFORMED LEND <dev> <mib>   <dev> not a non-negative int, or <mib> missing, zero, signed, not a
-//                                           whole number or too large, or a word too many
+//                                           whole number or too large, or a word too many; the whole-card word is
+//                                           exactly ALL, as the third and last word
 //       -> ERR MALFORMED RETURN <id>        no id, or a word too many
 //       -> ERR MALFORMED LENDABLE           a word after LENDABLE
 //
@@ -80,16 +92,24 @@ public:
     /// Take `mib` MiB on card `dev` out of the cache.  The handler has already rounded `mib` up to whole blocks and
     /// checked it against lend_cards(); the engine may still refuse (its pool changed) with the max it has now.
     virtual LendResult lend(int dev, std::size_t mib) = 0;
-    /// Put back the blocks of a lease lend() returned `token` for.  Busy leaves the lease open.
+    /// Put back the blocks of a lease lend() or lend_whole() returned `token` for.  Busy leaves the lease open.
     virtual GiveBack give_back(int dev, std::uint64_t token) = 0;
+    /// The whole-card footprint of card `dev` in MiB: what lend_whole() releases.  0: the card is not whole-lendable
+    /// (the default, for an engine that lends from its pools only).
+    virtual std::size_t whole_mib(int dev) { (void) dev; return 0; }
+    /// Lend the whole card: destroy its part so the card is free for another process.  The handler asks only for a
+    /// card with a whole_mib() and no open lease; the engine may still refuse (`max_mib`: what its pool can lend now).
+    /// ok: `mib` is the footprint released and `token` comes back in give_back().  The default refuses.
+    virtual LendResult lend_whole(int dev) { (void) dev; return {}; }
 };
 
 /// A card's state as the LENDABLE lines show it: the engine's figures plus what the open leases hold.
 struct LendCardStatus {
     int dev = 0;
-    std::size_t lendable_mib = 0;
+    std::size_t lendable_mib = 0;   // 0 while a whole-card lease is open on the card
     std::size_t lent_mib = 0;
     std::size_t block_mib = 0;
+    std::size_t whole_mib = 0;      // 0 when the card is not whole-lendable, and while its whole-card lease is open
 };
 
 /// What a control line is to the lend commands, by its first word (split on blanks as LendCommands::handle splits it):
@@ -140,8 +160,11 @@ private:
         int dev = 0;
         std::size_t mib = 0;
         std::uint64_t token = 0;
+        bool whole = false;   // a whole-card lease (lend_whole), not pool blocks
     };
     std::size_t lent_mib(int dev) const;
+    /// A lease of that kind is open on the card.
+    bool lease_open(int dev, bool whole) const;
 
     VramLender& lender_;
     std::map<std::uint64_t, Lease> leases_;   // by lease id
