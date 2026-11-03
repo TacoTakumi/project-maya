@@ -2,12 +2,14 @@
 gives it back.  The engine owns the leases (its LEND / RETURN / LENDABLE control lines, include/strata/core/
 vram_lend.hpp); this module turns the HTTP calls into those lines and their answers into JSON:
 
-    POST /vram/lend {"gpu": "0000:0a:00.0", "mib": 2048}
-        200 {"id": "7", "gpu": "0000:0a:00.0", "mib": 2048}   mib: what the engine lent (rounded up to its blocks)
-        400 {"error": ...}           mib missing, not a whole number (a bool is not one), 0 or negative; a gpu that is
-                                     not a PCI address or not one the engine uses (or a body that names it card, not
-                                     gpu); a body that is not a JSON object
-        409 {"max_mib": N}           more than the GPU can lend now (N: its lendable; 0 for a GPU that does not lend)
+    POST /vram/lend {"gpu": "0000:0a:00.0", "mib": 2048}      mib: a whole number of MiB, or "all" for the whole GPU
+        200 {"id": "7", "gpu": "0000:0a:00.0", "mib": 2048}   mib: what the engine lent (rounded up to its blocks; a
+                                     whole-card lend's footprint)
+        400 {"error": ...}           mib missing, not a whole number (a bool is not one), 0 or negative, or a string
+                                     other than exactly "all"; a gpu that is not a PCI address or not one the engine
+                                     uses (or a body that names it card, not gpu); a body that is not a JSON object
+        409 {"max_mib": N}           more than the GPU can lend now (N: its lendable; 0 for a GPU that does not lend),
+                                     and the whole-card refusals below
     POST /vram/return {"id": "7"}    (a number is taken too)
         200 {"id": "7", "gpu": "0000:0a:00.0", "mib": 2048}
         400 {"error": ...}           no id, or one that is not a word
@@ -15,13 +17,26 @@ vram_lend.hpp); this module turns the HTTP calls into those lines and their answ
                                      or the engine ended): nothing goes to the engine
         409 {"error": ..., "retry": true}   the memory is still in use: the lease stays open, try again later
     GET /vram/state
-        200 {"gpus": [{"gpu", "lendable", "lent"}, ...], "leases": [{"id", "gpu", "mib"}, ...]}
+        200 {"gpus": [{"gpu", "lendable", "lent"[, "whole_mib"]}, ...], "leases": [{"id", "gpu", "mib"}, ...]}
+                                     whole_mib: the footprint a whole-card lend releases - only on a GPU the engine can
+                                     lend whole, and not while its whole-card lease is open (lendable is 0 then, and
+                                     lent is the lease)
+
+A whole-card lend (LEND <dev> ALL: the engine destroys its part on the GPU, so the GPU is free for another process) is
+"mib": "all", or a number above the GPU's lendable and at most its whole_mib; it answers the footprint as mib.  The two
+kinds of lease never share a GPU, and the server refuses the mixes itself, before the engine sees a LEND (the engine
+refuses them too, by the same rule):
+        409 {"max_mib": lendable}    "all" on a GPU without whole_mib; a whole-card lend while any lease is open on it
+        409 {"max_mib": whole_mib}   a number above whole_mib
+        409 {"max_mib": 0}           a lend from the pool while the whole-card lease is open on the GPU
+To decide the kind the route reads LENDABLE first, so one lend is two engine commands.
 
 Every lend and return route answers 501 {"error": ...} for an engine without lending (it refuses the commands, or it
 is not a Maya engine), and 503 {"error": ...} when the engine is not running or did not answer; /vram/state then lists
 the engine's GPUs with lendable and lent 0 (no GPUs at all for an engine that reports none).  The engine takes the
 commands between its steps, and one step can read a long prompt: a LEND it answers after the route stopped waiting
-(Lender.answer_s, 30 s) still lends, and the server gives that lease back by itself - /vram/state lists it until the
+(Lender.answer_s, POOL_WAIT_S = 30 s; a whole-card lend destroys the GPU's part first, so it gets Lender.whole_answer_s,
+WHOLE_WAIT_S = 180 s) still lends, and the server gives that lease back by itself - /vram/state lists it until the
 engine has it back.
 
 A GPU is named by its PCI address, matched whatever its case or spelling (gpu_map.pci_addr: CUDA's, NVML's 8-digit
@@ -46,6 +61,9 @@ import re
 import threading
 
 from serve import gpu_map
+
+POOL_WAIT_S = 30.0      # how long a route waits for the engine's answer: a lend from the pool, a return, LENDABLE
+WHOLE_WAIT_S = 180.0    # a whole-card lend: the engine tears its part on the GPU down before it answers
 
 # The engine's answers to the lend commands: the server takes them off the request's lines (they come back while
 # requests run, untagged).  A request's own ERR never reads like these (the words after ERR are upper case here).
@@ -159,11 +177,13 @@ class Lender:
         self._owner = None                # the engine process the record belongs to
         self._leases: dict[str, dict] = {}   # id -> {"id", "gpu", "mib"}, in the order they were lent
         self._engine_id: dict[str, str] = {}  # id -> the engine's id for that lease
+        self._whole: set[str] = set()     # the ids of the whole-card leases (the others are from the GPU's pool)
         self._owed: dict[str, bool] = {}  # the leases the server gives back itself -> their RETURN is out now
         self._base = 0                    # added to the engine's ids: past every id an earlier engine process had
         self._top = 0                     # the highest id handed out
         self._can: bool | None = None     # the running engine takes the lend commands (None: not known yet)
-        self.answer_s = 30.0              # how long a route waits for the engine's answer
+        self.answer_s = POOL_WAIT_S       # how long a route waits for the engine's answer
+        self.whole_answer_s = WHOLE_WAIT_S   # ... to a whole-card lend
 
     # -- what the routes share
     def _sync(self, engine) -> bool:
@@ -174,6 +194,7 @@ class Lender:
         owner = getattr(engine, "proc", engine) if running else None
         if owner is not self._owner:
             self._owner, self._leases, self._engine_id, self._owed, self._can = owner, {}, {}, {}, None
+            self._whole = set()
             self._base = self._top
         return running
 
@@ -191,7 +212,7 @@ class Lender:
             self._post_return(engine, owner, lid, eid)
         return running, owner
 
-    def _record(self, owner, eid: str, addr: str, mib: int) -> dict | None:
+    def _record(self, owner, eid: str, addr: str, mib: int, whole: bool) -> dict | None:
         """A lease the engine process `owner` lent -> its record (None: that process has ended, and its leases with
         it).  The engines' ids start again with each process: the server's are theirs plus what earlier processes
         handed out, so an id from before a restart never names a lease of the new process.  Under the lock."""
@@ -204,9 +225,11 @@ class Lender:
             lid = str(n)
         lease = {"id": lid, "gpu": addr, "mib": mib}
         self._leases[lid], self._engine_id[lid] = lease, eid
+        if whole:
+            self._whole.add(lid)
         return lease
 
-    def _lent(self, engine, owner, addr: str, got: list[str], waited: bool, box: dict):
+    def _lent(self, engine, owner, addr: str, whole: bool, got: list[str], waited: bool, box: dict):
         """The engine's answer to a LEND (as it comes): its lease in the record.  One whose caller stopped waiting
         goes back to the engine - nobody will use it; it stays in the record, so /vram/state lists it, until the
         engine has it back."""
@@ -214,7 +237,7 @@ class Lender:
         if f[0] != "LENT" or len(f) != 4 or not f[3].isdigit():
             return
         with self._lock:
-            box["lease"] = lease = self._record(owner, f[1], addr, int(f[3]))
+            box["lease"] = lease = self._record(owner, f[1], addr, int(f[3]), whole)
             if lease is None or waited:
                 return
             self._owed[lease["id"]] = True
@@ -236,6 +259,7 @@ class Lender:
                 self._leases.pop(lid, None)
                 self._engine_id.pop(lid, None)
                 self._owed.pop(lid, None)
+                self._whole.discard(lid)
             elif lid in self._owed:       # still in use: sent again at the next route
                 self._owed[lid] = False
 
@@ -254,10 +278,23 @@ class Lender:
                 out.append((r["dev"], addr))
         return out
 
-    def _ask(self, engine, line: str, then=None) -> list[str]:
+    @staticmethod
+    def _figures(got: list[str]) -> dict[int, tuple[int, int, int]]:
+        """A LENDABLE answer's lines -> {engine GPU number: (lendable, lent, whole)} in MiB (whole: the footprint a
+        whole-card lend releases; 0 for a GPU that is not whole-lendable, and while its whole-card lease is open).
+        A line without the whole= field (an engine before whole-card lending) reads as whole 0."""
+        out: dict[int, tuple[int, int, int]] = {}
+        for line in got:
+            f = dict(kv.partition("=")[::2] for kv in line.split()[1:]) if line.startswith("LENDABLE ") else {}
+            f.setdefault("whole", "0")
+            if all(f.get(k, "").isdigit() for k in ("dev", "lendable", "lent", "whole")):
+                out[int(f["dev"])] = (int(f["lendable"]), int(f["lent"]), int(f["whole"]))
+        return out
+
+    def _ask(self, engine, line: str, then=None, wait: float | None = None) -> list[str]:
         """The engine's answer to `line` (`then`: what it changes, run as it comes - Calls).  ValueError when it does
-        not answer in answer_s."""
-        got = engine.lend_command(line, timeout=self.answer_s, then=then)
+        not answer in `wait` (answer_s)."""
+        got = engine.lend_command(line, timeout=self.answer_s if wait is None else wait, then=then)
         self._can = not got[0].startswith("ERR unsupported command")
         if not self._can:
             raise NoLending(got[0])
@@ -287,8 +324,8 @@ class Lender:
         if not isinstance(req, dict):
             return 400, {"error": "the request body must be a JSON object {\"gpu\": ..., \"mib\": ...}"}
         mib = req.get("mib")
-        if not isinstance(mib, int) or isinstance(mib, bool) or mib <= 0:
-            return 400, {"error": "mib must be a whole number of MiB above 0"}
+        if mib != "all" and (not isinstance(mib, int) or isinstance(mib, bool) or mib <= 0):
+            return 400, {"error": "mib must be a whole number of MiB above 0, or \"all\" for the whole GPU"}
         if "gpu" not in req and "card" in req:        # (the field's name before it was gpu)
             return 400, {"error": "the GPU's field is \"gpu\", not \"card\": {\"gpu\": \"0000:0a:00.0\", \"mib\": ...}"}
         addr = gpu_map.pci_addr(req.get("gpu"))
@@ -302,10 +339,36 @@ class Lender:
         running, owner = self._begin(engine)
         if not running:
             return 503, {"error": "the model is not loaded"}
+        # the kind of lend, from what the GPU can lend now: from its pool as asked, or the whole GPU ("all", or more
+        # than the pool gives and at most the footprint).  The two kinds never share a GPU: a whole-card lend finds no
+        # lease open on it, and nothing comes from the pool while the whole-card lease is open.  Refused here, with
+        # the engine's own answer, before it sees a LEND.
+        try:
+            lendable, lent, whole = self._figures(self._ask(engine, "LENDABLE")).get(dev, (0, 0, 0))
+        except NoLending:
+            return self._unsupported()
+        except (RuntimeError, ValueError, OSError) as e:
+            return self._gone(e)
+        with self._lock:
+            whole_open = self._owner is owner and any(
+                lid in self._whole and x["gpu"] == addr for lid, x in self._leases.items())
+        if mib == "all":
+            whole_lend = True
+        elif mib <= lendable:
+            whole_lend = False
+        elif whole and mib <= whole:
+            whole_lend = True
+        else:
+            return 409, {"max_mib": whole or lendable}
+        if whole_lend and (not whole or lent or whole_open):
+            return 409, {"max_mib": lendable}
+        if not whole_lend and whole_open:
+            return 409, {"max_mib": 0}
         box: dict = {}
         try:
-            got = self._ask(engine, f"LEND {dev} {mib}",
-                            lambda got, waited: self._lent(engine, owner, addr, got, waited, box))
+            got = self._ask(engine, f"LEND {dev} {'ALL' if whole_lend else mib}",
+                            lambda got, waited: self._lent(engine, owner, addr, whole_lend, got, waited, box),
+                            wait=self.whole_answer_s if whole_lend else self.answer_s)
         except NoLending:
             return self._unsupported()
         except ValueError as e:           # (the engine is busy with a long step: it lends once it is done)
@@ -377,13 +440,10 @@ class Lender:
             got = self._ask(engine, "LENDABLE", lambda got, waited: self._listed(owner, box))
         except (NoLending, RuntimeError, ValueError, OSError):
             return 200, idle
-        figures = {}
-        for line in got:
-            f = dict(kv.partition("=")[::2] for kv in line.split()[1:]) if line.startswith("LENDABLE ") else {}
-            if all(f.get(k, "").isdigit() for k in ("dev", "lendable", "lent")):
-                figures[int(f["dev"])] = (int(f["lendable"]), int(f["lent"]))
+        figures = self._figures(got)
         name = dict(gpus)
-        out = [{"gpu": name[d], "lendable": figures[d][0], "lent": figures[d][1]} for d in figures if d in name]
+        out = [{"gpu": name[d], "lendable": lendable, "lent": lent} | ({"whole_mib": whole} if whole else {})
+               for d, (lendable, lent, whole) in figures.items() if d in name]
         # the model's other GPUs (no lending there): listed, with nothing to give
         out += [{"gpu": a, "lendable": 0, "lent": 0} for d, a in gpus if d not in figures]
         return 200, {"gpus": out, "leases": box.get("leases", [])}
