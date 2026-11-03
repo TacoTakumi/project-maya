@@ -30,10 +30,12 @@ namespace {
 constexpr size_t M = size_t{1} << 20;
 
 // One card of the fake engine: a pool of whole blocks, the prompt path's borrow and the minimum slots it keeps.  The
-// blocks lent leave the pool, as they leave a real cache, so the rule sees the pool after lends.
+// blocks lent leave the pool, as they leave a real cache, so the rule sees the pool after lends.  `whole` is the
+// card's whole-card footprint (0: the card lends from its pool only).
 struct FakeCard {
     int dev;
     size_t pool, borrow, min_slots, block;   // bytes
+    size_t whole = 0;                        // bytes
 };
 
 struct FakeEngine : VramLender {
@@ -42,6 +44,7 @@ struct FakeEngine : VramLender {
     std::set<uint64_t> busy;                             // tokens whose memory someone still holds
     uint64_t next_token = 1000;
     size_t refuse_max = SIZE_MAX;   // below SIZE_MAX: the next lend is refused with this max (a pool that shrank)
+    int whole_calls = 0;            // lend_whole() calls, whole-lendable card or not
 
     FakeCard* card(int dev) {
         for (FakeCard& c : cards)
@@ -68,6 +71,27 @@ struct FakeEngine : VramLender {
         r.mib = mib;
         r.token = next_token++;
         leases[r.token] = {dev, mib * M};
+        return r;
+    }
+    size_t whole_mib(int dev) override {
+        FakeCard* c = card(dev);
+        return c ? c->whole / M : 0;
+    }
+    LendResult lend_whole(int dev) override {
+        ++whole_calls;
+        LendResult r;
+        FakeCard* c = card(dev);
+        if (!c || c->whole == 0) return r;
+        if (refuse_max != SIZE_MAX) {
+            r.max_mib = refuse_max;
+            refuse_max = SIZE_MAX;
+            return r;
+        }
+        // the pool figure is left as it is: the handler shows 0 for the card while the whole lease is open
+        r.ok = true;
+        r.mib = c->whole / M;
+        r.token = next_token++;
+        leases[r.token] = {dev, 0};
         return r;
     }
     GiveBack give_back(int dev, uint64_t token) override {
@@ -109,19 +133,19 @@ int main() {
     CHECK(lendable_bytes(640 * M - 192 * M, 64 * M, 128 * M, 64 * M) == 256 * M);
 
     FakeEngine eng;
-    eng.cards = {{0, 640 * M, 64 * M, 128 * M, 64 * M},      // lendable 448 MiB, blocks of 64
-                 {2, 1000 * M, 250 * M, 300 * M, 100 * M},   // lendable 400 MiB, blocks of 100
-                 {3, 100 * M, 64 * M, 128 * M, 64 * M}};     // lendable 0
+    eng.cards = {{0, 640 * M, 64 * M, 128 * M, 64 * M},                // lendable 448 MiB, blocks of 64
+                 {2, 1000 * M, 250 * M, 300 * M, 100 * M, 15000 * M},   // lendable 400 MiB, blocks of 100, whole-lendable
+                 {3, 100 * M, 64 * M, 128 * M, 64 * M}};               // lendable 0
     LendCommands desk(eng);
 
     // ---- LENDABLE: one line per card, then END
-    CHECK_REPLY(desk, "LENDABLE", "LENDABLE dev=0 lendable=448 lent=0\n"
-                                  "LENDABLE dev=2 lendable=400 lent=0\n"
-                                  "LENDABLE dev=3 lendable=0 lent=0\n"
+    CHECK_REPLY(desk, "LENDABLE", "LENDABLE dev=0 lendable=448 lent=0 whole=0\n"
+                                  "LENDABLE dev=2 lendable=400 lent=0 whole=15000\n"
+                                  "LENDABLE dev=3 lendable=0 lent=0 whole=0\n"
                                   "END\n");
-    CHECK_REPLY(desk, "  LENDABLE \r", "LENDABLE dev=0 lendable=448 lent=0\n"
-                                       "LENDABLE dev=2 lendable=400 lent=0\n"
-                                       "LENDABLE dev=3 lendable=0 lent=0\n"
+    CHECK_REPLY(desk, "  LENDABLE \r", "LENDABLE dev=0 lendable=448 lent=0 whole=0\n"
+                                       "LENDABLE dev=2 lendable=400 lent=0 whole=15000\n"
+                                       "LENDABLE dev=3 lendable=0 lent=0 whole=0\n"
                                        "END\n");
 
     // ---- LEND: rounded up to whole blocks (100 -> 2 blocks of 64), the lease named by a fresh id
@@ -135,9 +159,9 @@ int main() {
     CHECK(desk.open_leases() == 2);
     CHECK(eng.leases.size() == 2);
     // lendable shrinks by what is out (448 - 192), lent shows it
-    CHECK_REPLY(desk, "LENDABLE", "LENDABLE dev=0 lendable=256 lent=192\n"
-                                  "LENDABLE dev=2 lendable=400 lent=0\n"
-                                  "LENDABLE dev=3 lendable=0 lent=0\n"
+    CHECK_REPLY(desk, "LENDABLE", "LENDABLE dev=0 lendable=256 lent=192 whole=0\n"
+                                  "LENDABLE dev=2 lendable=400 lent=0 whole=15000\n"
+                                  "LENDABLE dev=3 lendable=0 lent=0 whole=0\n"
                                   "END\n");
 
     // ---- ERR MAX: more than the card's lendable, with the lendable it has now
@@ -158,9 +182,9 @@ int main() {
     CHECK(desk.open_leases() == 2);   // a busy lease stays open
     CHECK_REPLY(desk, ("RETURN " + ra).c_str(), ("RETURNED " + ra + "\n").c_str());
     CHECK(desk.open_leases() == 1);
-    CHECK_REPLY(desk, "LENDABLE", "LENDABLE dev=0 lendable=384 lent=64\n"
-                                  "LENDABLE dev=2 lendable=400 lent=0\n"
-                                  "LENDABLE dev=3 lendable=0 lent=0\n"
+    CHECK_REPLY(desk, "LENDABLE", "LENDABLE dev=0 lendable=384 lent=64 whole=0\n"
+                                  "LENDABLE dev=2 lendable=400 lent=0 whole=15000\n"
+                                  "LENDABLE dev=3 lendable=0 lent=0 whole=0\n"
                                   "END\n");
     CHECK_REPLY(desk, ("RETURN " + ra).c_str(), ("ERR UNKNOWN " + ra + "\n").c_str());   // already returned
     CHECK_REPLY(desk, ("RETURN " + rb).c_str(), ("ERR BUSY " + rb + "\n").c_str());      // still held: retry
@@ -177,12 +201,65 @@ int main() {
     CHECK(c != 0 && d != 0 && c != d && c != a && c != b && d != a && d != b);
     CHECK_REPLY(desk, "LEND 2 101", "ERR MAX 100\n");
     CHECK_REPLY(desk, ("RETURN " + std::to_string(d)).c_str(), ("RETURNED " + std::to_string(d) + "\n").c_str());
-    CHECK_REPLY(desk, "LENDABLE", "LENDABLE dev=0 lendable=448 lent=0\n"
-                                  "LENDABLE dev=2 lendable=200 lent=200\n"
-                                  "LENDABLE dev=3 lendable=0 lent=0\n"
+    CHECK_REPLY(desk, "LENDABLE", "LENDABLE dev=0 lendable=448 lent=0 whole=0\n"
+                                  "LENDABLE dev=2 lendable=200 lent=200 whole=15000\n"
+                                  "LENDABLE dev=3 lendable=0 lent=0 whole=0\n"
                                   "END\n");
     CHECK_REPLY(desk, ("RETURN " + std::to_string(c)).c_str(), ("RETURNED " + std::to_string(c) + "\n").c_str());
-    CHECK(desk.handle("LEND 2 400", r) && lent_id(r, 2, 400) != 0);   // the whole lendable
+    CHECK(desk.handle("LEND 2 400", r));   // the whole lendable
+    const uint64_t f = lent_id(r, 2, 400);
+    CHECK(f != 0);
+    CHECK_REPLY(desk, "LEND 2 1", "ERR MAX 0\n");
+
+    // ---- LEND <dev> ALL: the whole card, for a card the engine reports a whole-card footprint for.  The two kinds
+    // of lease never share a card: a pool lease open on it refuses the whole lend with the pool's lendable
+    CHECK_REPLY(desk, "LEND 2 ALL", "ERR MAX 0\n");   // 400 of 400 out
+    CHECK_REPLY(desk, ("RETURN " + std::to_string(f)).c_str(), ("RETURNED " + std::to_string(f) + "\n").c_str());
+    CHECK(desk.handle("LEND 2 100", r));
+    const uint64_t g = lent_id(r, 2, 100);
+    CHECK(g != 0);
+    CHECK_REPLY(desk, "LEND 2 ALL", "ERR MAX 300\n");
+    CHECK(eng.whole_calls == 0);   // refused by the handler, the engine was not asked
+    CHECK_REPLY(desk, ("RETURN " + std::to_string(g)).c_str(), ("RETURNED " + std::to_string(g) + "\n").c_str());
+    // a card that lends from its pool only (footprint 0): ERR MAX with its lendable, the engine is not asked
+    CHECK_REPLY(desk, "LEND 0 ALL", "ERR MAX 448\n");
+    CHECK_REPLY(desk, "LEND 3 ALL", "ERR MAX 0\n");
+    CHECK_REPLY(desk, "LEND 5 ALL", "ERR NODEV 5\n");
+    CHECK(eng.whole_calls == 0);
+    // the engine may still refuse: its max is the answer
+    eng.refuse_max = 300;
+    CHECK_REPLY(desk, "LEND 2 ALL", "ERR MAX 300\n");
+    CHECK(eng.whole_calls == 1 && desk.open_leases() == 0);
+    // the lend: LENT with the footprint released, one lend_whole() call
+    CHECK(desk.handle("LEND 2 ALL", r));
+    const uint64_t h = lent_id(r, 2, 15000);
+    CHECK(h != 0 && h != f && h != g);
+    CHECK(eng.whole_calls == 2 && desk.open_leases() == 1 && eng.leases.size() == 1);
+    // while the whole lease is open: lendable 0 and whole 0 for the card (whatever pool the engine reports), lent is
+    // the lease; no lend of either kind on that card
+    CHECK_REPLY(desk, "LENDABLE", "LENDABLE dev=0 lendable=448 lent=0 whole=0\n"
+                                  "LENDABLE dev=2 lendable=0 lent=15000 whole=0\n"
+                                  "LENDABLE dev=3 lendable=0 lent=0 whole=0\n"
+                                  "END\n");
+    CHECK_REPLY(desk, "LEND 2 1", "ERR MAX 0\n");
+    CHECK_REPLY(desk, "LEND 2 ALL", "ERR MAX 0\n");
+    CHECK(eng.whole_calls == 2);
+    CHECK(desk.handle("LEND 0 64", r) && lent_id(r, 0, 64) != 0);   // another card lends as before
+    CHECK_REPLY(desk, ("RETURN " + std::to_string(lent_id(r, 0, 64))).c_str(),
+                ("RETURNED " + std::to_string(lent_id(r, 0, 64)) + "\n").c_str());
+    // the normal RETURN gives the card back: whole= and lendable come back
+    eng.busy.insert(eng.leases.begin()->first);
+    CHECK_REPLY(desk, ("RETURN " + std::to_string(h)).c_str(), ("ERR BUSY " + std::to_string(h) + "\n").c_str());
+    CHECK(desk.open_leases() == 1);
+    eng.busy.clear();
+    CHECK_REPLY(desk, ("RETURN " + std::to_string(h)).c_str(), ("RETURNED " + std::to_string(h) + "\n").c_str());
+    CHECK(desk.open_leases() == 0 && eng.leases.empty());
+    CHECK_REPLY(desk, "LENDABLE", "LENDABLE dev=0 lendable=448 lent=0 whole=0\n"
+                                  "LENDABLE dev=2 lendable=400 lent=0 whole=15000\n"
+                                  "LENDABLE dev=3 lendable=0 lent=0 whole=0\n"
+                                  "END\n");
+    CHECK_REPLY(desk, ("RETURN " + std::to_string(h)).c_str(), ("ERR UNKNOWN " + std::to_string(h) + "\n").c_str());
+    CHECK(desk.handle("LEND 2 400", r) && lent_id(r, 2, 400) != 0);   // the pool lends again, all of it
     CHECK_REPLY(desk, "LEND 2 1", "ERR MAX 0\n");
 
     // ---- UNKNOWN: ids never handed out (the ids are opaque: any one word is looked up)
@@ -193,7 +270,7 @@ int main() {
     // ---- malformed lend commands: answered with an ERR, never passed on
     for (const char* bad : {"LEND", "LEND 0", "LEND x 10", "LEND -1 10", "LEND 0 0", "LEND 0 -5", "LEND 0 +5",
                             "LEND 0 1.5", "LEND 0 10MiB", "LEND 0 10 extra", "LEND 0 99999999999999999999999",
-                            "LEND 99999999999 10"})
+                            "LEND 99999999999 10", "LEND 2 all", "LEND 2 All", "LEND 2 ALL 5", "LEND ALL", "LEND ALL 2"})
         CHECK_REPLY(desk, bad, "ERR MALFORMED LEND <dev> <mib>\n");
     for (const char* bad : {"RETURN", "RETURN 1 2"}) CHECK_REPLY(desk, bad, "ERR MALFORMED RETURN <id>\n");
     CHECK_REPLY(desk, "LENDABLE 0", "ERR MALFORMED LENDABLE\n");
@@ -220,11 +297,12 @@ int main() {
     // status(): the same figures the LENDABLE lines show, with the block size
     const auto st = desk.status();
     CHECK(st.size() == 3 && st[1].dev == 2 && st[1].lendable_mib == 0 && st[1].lent_mib == 400 && st[1].block_mib == 100);
+    CHECK(st[0].whole_mib == 0 && st[1].whole_mib == 15000 && st[2].whole_mib == 0);
 
     // ---- the control-line routing: which lines are lend commands, and which of them only read
     for (const char* l : {"LENDABLE", "  LENDABLE \r", "LENDABLE 0", "LENDABLE\t"})
         CHECK(lend_line_kind(l) == LendLineKind::lendable);
-    for (const char* l : {"LEND 0 64", "LEND", "LEND x 10", " RETURN 7", "RETURN", "RETURN 1 2", "LEND 0 64\r"})
+    for (const char* l : {"LEND 0 64", "LEND 2 ALL", "LEND", "LEND x 10", " RETURN 7", "RETURN", "RETURN 1 2", "LEND 0 64\r"})
         CHECK(lend_line_kind(l) == LendLineKind::change);
     for (const char* l : {"", "   ", "GEN 1 2 3", "QUIT", "STOP", "STOP 3", "PAUSE keep", "LOGP 2 1,2,3", "GENI 1 2",
                           "LENDX 0 10", "lend 0 10", "RETURNED 1", "LENDABLES", "LENT 1 0 64", "END", "X LEND 0 64"})
