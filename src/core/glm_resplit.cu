@@ -33,9 +33,16 @@
 //            (bg_hold), the copy stream synchronized, fast_boundary run (every move landed, every route taken), no
 //            move or drain left, then cudaDeviceSynchronize - every stream of every card (compute, copy, prefetch,
 //            the prompt path's, the window lanes, the drafter's);
-//   save     the conversation state to RAM: Glm5Model::slot_save's bytes (the snapshot's recurrent states, the open
-//            indexer pools and the DSA caches up to the snapshot's position, one section a part).  No snapshot (no
-//            request yet): nothing to carry, the chain is reset after the rebuild;
+//   save     the conversation state to RAM (resplit_state_save): Glm5Model::slot_save's bytes (the snapshot's
+//            recurrent states, the open indexer pools and the DSA caches up to the snapshot's position, one section a
+//            part).  A decode stopped at a token for the lend (the serve loop's lend stop) stands PAST the snapshot:
+//            its live state - the KDA states, the open pool rows and the DSA caches up to the stop position, the same
+//            on every part - goes into a second slot, so the decode goes on from where it stopped instead of reading
+//            its tokens again.  No snapshot (no request yet): nothing to carry, the chain is reset after the rebuild.
+//            Several sequences (STRATA_GLM_SEQS): every part is bound to the head's sequence first and that one's
+//            state is what crosses; the others' states die with the destroyed parts (the serve loop forgets their
+//            prefix caches and resets them).  The command loop runs a whole-card change only idle or at the one
+//            decode's token stop, so the live state is never a half-read prompt or several decodes;
 //   destroy  the lent part and the neighbour, unlinked from the chain first (a part's destructor takes the chain
 //            after it along), the later one first: each part frees its device and pinned memory under its own
 //            device, as at exit;
@@ -93,6 +100,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <set>
 #include <string>
@@ -339,10 +347,8 @@ bool Glm5Model::lend_whole_plan(int dev, WholePlan& plan, std::string& err) {
         err = card + " is not whole-lendable: the load's room check did not pass it";
         return false;
     }
-    if (seq_count() > 1) {
-        err = card + " is not lent whole: several conversations at once (STRATA_GLM_SEQS) are set up";
-        return false;
-    }
+    // (several sequences, STRATA_GLM_SEQS: no refusal here - the command loop runs the lend once every request has
+    // ended, and lend_whole_run carries the bound sequence's state)
     std::vector<ResplitPart> parts;
     std::vector<Glm5Model*> chain;
     resplit_figures(parts, chain);
@@ -449,6 +455,13 @@ bool Glm5Model::resplit_finish(const std::vector<Glm5Model*>& fresh, std::string
     // read the other bank's stale rows: garbage from the merged part on)
     for (Glm5Model* f : fresh)
         if (f->fast_ != nullptr && fast_ != nullptr) f->fast_->win.bank = fast_->win.bank;
+    // several sequences (STRATA_GLM_SEQS): a fresh part comes up bound to its sequence 0; every path reads the bound
+    // sequence on every part, so it joins the one the head is bound to (the lend bound every survivor to it)
+    for (Glm5Model* f : fresh) f->seq_bind(seq_bound());
+    // ... and the pipelined decode's per-sequence buffers (the hop rows and events a token crosses the parts with,
+    // seq_pipe_ready: set up once, on the head's first step) on the fresh parts too - the first step after the first
+    // lend under --parallel copied the hop through the merged part's null row (an invalid argument)
+    if (!seq_.empty() && seq_[0].hop_h != nullptr && !seq_pipe_ready(e)) return false;
     int tmin = 0;
     for (Glm5Model* m : now)
         if (m->prefill_chunk() > 0) tmin = tmin == 0 ? m->prefill_chunk() : std::min(tmin, m->prefill_chunk());
@@ -458,6 +471,175 @@ bool Glm5Model::resplit_finish(const std::vector<Glm5Model*>& fresh, std::string
     for (Glm5Model* f : fresh)
         if (!f->fast_helper_check(e)) return false;
     cudaSetDevice(dev_);
+    return true;
+}
+
+// ---- the conversation state a re-split carries (ResplitState, glm_model.hpp)
+// The snapshot's slot (slot_save: its KDA states, its open pool rows and every DSA cache up to its position) is what an
+// idle lend carries, and slot_load puts it back as the live state and the snapshot.  A decode stopped at a token for
+// the lend stands PAST the snapshot: its KDA states, its open pool rows and its DSA caches up to the stop position are
+// the live state the decode goes on from (the serve loop's lend_resume reads the one token still unread), so a second
+// slot of the live state is taken too - snapshot_save makes the live state the snapshot for the moment, slot_save
+// writes it, and the snapshot's own records come back from the first slot's bytes (snap_from_slot).  The restore loads
+// the live slot (the live state and, for the moment, the snapshot) and then puts the snapshot's records back under it:
+// the live state stays, the snapshot is the prompt's again, and the next turn's prefix reuse finds it.
+
+// the snapshot's records - each part's KDA states (snap_) and open pool rows (snap_pool_) - from a slot of n_pos
+// positions, whatever split saved it (Glm5SlotLayout maps its sections onto the parts as they stand); the live state,
+// the position and the DSA caches are not touched
+bool Glm5Model::snap_from_slot(const std::vector<uint8_t>& slot, int64_t n_pos, std::string& err) {
+    ckpt_join();   // (ckpt_save_snapshot reads snap_ / snap_pool_)
+    const Glm5SlotLayout::Read read = [&](uint64_t at, void* p, size_t bytes) {
+        if (at + bytes > slot.size()) return false;
+        std::memcpy(p, slot.data() + at, bytes);
+        return true;
+    };
+    // the record sizes as the slot writer has them (glm_fast_path.cu's slot_sizes)
+    Glm5SlotLayout::Sizes sz;
+    sz.run = (int64_t) g_.d_inner() * g_.kda_head_dim + (int64_t) 3 * g_.d_inner() * (g_.d_conv - 1);
+    sz.pool_rec = (int64_t) 2 * (g_.idx_kpool - 1) * g_.idx_key;
+    sz.lat = n_pos * (lat_q8_ ? (int64_t) gf::lat8_rec_bytes(g_.kv_lora) / 4 : fast_mode_ ? g_.kv_lora / 2 : g_.kv_lora);
+    sz.pool = ((n_pos + g_.idx_kpool - 1) / g_.idx_kpool) * g_.idx_key;
+    std::vector<Glm5SlotLayout::Section> secs;
+    int64_t n = 0;
+    if (!Glm5SlotLayout::parse(read, slot.size(), sz.pool_rec, secs, n, err)) return false;
+    if (n != n_pos) {
+        err = "the slot holds " + std::to_string(n) + " positions, not " + std::to_string(n_pos);
+        return false;
+    }
+    std::vector<Glm5Model*> halves;
+    std::vector<Glm5SlotLayout::Part> parts;
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        halves.push_back(m);
+        parts.push_back({m->l0_, m->l1_, m->mtp_il_ >= 0});
+    }
+    std::vector<bool> recr((size_t) g_.n_layers);
+    for (int il = 0; il < g_.n_layers; ++il) recr[(size_t) il] = g_.is_recr(il);
+    std::vector<std::vector<Glm5SlotLayout::Piece>> pieces;
+    if (!Glm5SlotLayout::map(secs, parts, recr, sz, pieces, err)) return false;
+    for (size_t h = 0; h < halves.size(); ++h) {
+        Glm5Model* m = halves[h];
+        if (m->fast_ == nullptr) {
+            err = "no fast path";
+            return false;
+        }
+        int32_t n_rec = 0;
+        for (int il = m->l0_; il < m->l1_; ++il) n_rec += m->g_.is_recr(il);
+        const size_t n_dsa = m->dsa_layers().size();
+        const std::vector<Glm5SlotLayout::Piece>& src = pieces[h];
+        if (src.size() != (size_t) n_rec + 3 * n_dsa) {
+            err = "the slot's layout differs from this model's";
+            return false;
+        }
+        cudaSetDevice(m->dev_);
+        cudaStreamSynchronize(m->fast_->cs);
+        if (m->snap_ == nullptr && n_rec > 0 &&
+            cudaMalloc(&m->snap_, (size_t) n_rec * (size_t) sz.run * sizeof(float)) != cudaSuccess) {
+            cudaGetLastError();
+            m->snap_ = nullptr;
+            cudaSetDevice(dev_);
+            err = "the snapshot did not allocate";
+            return false;
+        }
+        if (n_dsa > 0 && m->snap_pool_ == nullptr &&
+            cudaMalloc(&m->snap_pool_, n_dsa * (size_t) sz.pool_rec * sizeof(float)) != cudaSuccess) {
+            cudaGetLastError();
+            m->snap_pool_ = nullptr;
+            cudaSetDevice(dev_);
+            err = "the snapshot did not allocate";
+            return false;
+        }
+        // the mapping's order: a KDA record a recurrent layer, then a closed-pool record a DSA layer (the runs follow,
+        // not wanted here)
+        for (size_t k = 0; k < (size_t) n_rec + n_dsa; ++k) {
+            const bool kda = k < (size_t) n_rec;
+            float* dst = kda ? m->snap_ + (int64_t) k * sz.run : m->snap_pool_ + (int64_t) (k - (size_t) n_rec) * sz.pool_rec;
+            const int64_t floats = kda ? sz.run : sz.pool_rec;
+            if (src[k].floats != floats || src[k].at + (uint64_t) floats * sizeof(float) > slot.size()) {
+                cudaSetDevice(dev_);
+                err = "the slot's layout differs from this model's";
+                return false;
+            }
+            if (cudaMemcpy(dst, slot.data() + src[k].at, (size_t) floats * sizeof(float), cudaMemcpyHostToDevice) !=
+                cudaSuccess) {
+                cudaGetLastError();
+                cudaSetDevice(dev_);
+                err = "the snapshot did not read back";
+                return false;
+            }
+        }
+        m->snap_pos_ = n;
+    }
+    cudaSetDevice(dev_);
+    return true;
+}
+
+bool Glm5Model::resplit_state_save(ResplitState& st, std::string& err) {
+    st = ResplitState{};
+    bool have = snap_pos_ >= 0;
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+        have = have && m->fast_ != nullptr && m->snap_pos_ == snap_pos_;
+    if (!have) return true;   // (nothing to carry: the chain is reset after the rebuild)
+    std::string e;
+    if (slot_save(st.snap, e) == 0) {
+        err = "glm lend: the conversation state did not save: " + e;
+        return false;
+    }
+    st.snap_pos = snap_pos_;
+    // the live state: a decode stopped at a token past the snapshot, every part at that position
+    bool live = pos_ > snap_pos_;
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) live = live && m->pos_ == pos_;
+    if (!live) return true;
+    const int64_t p = pos_;
+    const auto snap_back = [&](const char* when) -> bool {   // the snapshot as it was, from its slot
+        std::string e2;
+        if (snap_from_slot(st.snap, st.snap_pos, e2)) return true;
+        // (the snapshot is the live state's now and belongs to no prompt: dropped, the next turn reads its prompt)
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->snap_pos_ = -1;
+        err = std::string("glm lend: the snapshot did not come back ") + when + ": " + e2;
+        return false;
+    };
+    if (!snapshot_save()) {
+        if (!snap_back("after the live state's snapshot failed")) return false;
+        std::fprintf(stderr, "glm lend: the decode's live state at %lld positions did not snapshot: the decode reads "
+                             "its tokens again after the re-split\n", (long long) p);
+        return true;
+    }
+    const uint64_t n = slot_save(st.live, e);
+    if (!snap_back("after the live state's save")) return false;
+    if (n == 0) {
+        std::fprintf(stderr, "glm lend: the decode's live state at %lld positions did not save (%s): the decode reads "
+                             "its tokens again after the re-split\n", (long long) p, e.c_str());
+        st.live.clear();
+        return true;
+    }
+    st.live_pos = p;
+    return true;
+}
+
+bool Glm5Model::resplit_state_load(const ResplitState& st, std::string& err) {
+    if (st.snap_pos < 0) {
+        err = "nothing saved";
+        return false;
+    }
+    std::string e;
+    if (st.live_pos < 0) {
+        if (!slot_load(st.snap, st.snap_pos, e)) {
+            err = "the conversation state did not load back: " + e;
+            return false;
+        }
+        return true;
+    }
+    // the live state first (slot_load makes it the snapshot too, and sets the position), then the snapshot's own
+    // records under it
+    if (!slot_load(st.live, st.live_pos, e)) {
+        err = "the decode's live state did not load back: " + e;
+        return false;
+    }
+    if (!snap_from_slot(st.snap, st.snap_pos, e)) {
+        err = "the snapshot did not load back under the live state: " + e;
+        return false;
+    }
     return true;
 }
 
@@ -490,6 +672,18 @@ void leave_card(int dev, int back_to) {
     if (re != cudaSuccess)
         std::fprintf(stderr, "glm lend: CUDA%d cudaDeviceReset: %s (the process may still show on the card)\n", dev,
                      cudaGetErrorString(re));
+}
+
+}  // namespace
+
+namespace {
+
+// the log line's words for the state a re-split carried
+std::string resplit_state_words(const Glm5Model::ResplitState& st) {
+    if (st.snap_pos < 0) return "no conversation state to carry";
+    std::string w = "the conversation state at " + std::to_string(st.snap_pos) + " positions carried over";
+    if (st.live_pos >= 0) w += ", and the decode's live state at " + std::to_string(st.live_pos) + " positions";
+    return w;
 }
 
 }  // namespace
@@ -541,20 +735,13 @@ bool Glm5Model::lend_whole_run(const WholePlan& plan, std::string& err) {
     if (!resplit_quiet(chain, err)) return false;
     const double t_quiet = ms_since(t_all);
 
-    // ---- save: the conversation state to RAM (nothing to carry without a snapshot)
+    // ---- save: the conversation state to RAM (nothing to carry without a snapshot; the live state too when a
+    //      decode stopped here).  Several sequences: every part bound to the head's, whose state crosses
     const auto t1 = clock::now();
-    std::vector<uint8_t> slot;
-    int64_t n_pos = -1;
-    bool have_state = snap_pos_ >= 0;
-    for (Glm5Model* m : chain) have_state = have_state && m->snap_pos_ == snap_pos_;
-    if (have_state) {
-        std::string e;
-        if (slot_save(slot, e) == 0) {
-            err = "glm lend: the conversation state did not save: " + e;
-            return false;
-        }
-        n_pos = snap_pos_;
-    }
+    if (seq_count() > 1) seq_bind_all(seq_bound());
+    ResplitState st;
+    if (!resplit_state_save(st, err)) return false;
+    const bool have_state = st.snap_pos >= 0;
     const double t_save = ms_since(t1);
 
     // ---- what the reload needs, read before the parts go (the merged tier's budget: the plan's figure, sized on the
@@ -604,7 +791,7 @@ bool Glm5Model::lend_whole_run(const WholePlan& plan, std::string& err) {
         prev->split_next_ = std::move(a);
         std::string e;
         if (!resplit_finish({ap, bp}, e)) fatal("the rebuilt split did not finish: " + e);
-        if (!have_state || !slot_load(slot, n_pos, e)) {
+        if (!have_state || !resplit_state_load(st, e)) {
             reset();
             for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->snap_pos_ = -1;
         }
@@ -628,7 +815,7 @@ bool Glm5Model::lend_whole_run(const WholePlan& plan, std::string& err) {
     const auto t5 = clock::now();
     if (have_state) {
         std::string e;
-        if (!slot_load(slot, n_pos, e)) {
+        if (!resplit_state_load(st, e)) {
             std::fprintf(stderr, "glm lend: the conversation state did not load back onto the new split (%s): the next "
                                  "request reads its prompt again\n", e.c_str());
             reset();
@@ -645,8 +832,7 @@ bool Glm5Model::lend_whole_run(const WholePlan& plan, std::string& err) {
     leave_card(ldev, dev_);
     const double t_release = ms_since(t6);
 
-    const std::string state = have_state ? "the conversation state at " + std::to_string(n_pos) + " positions carried over"
-                                         : "no conversation state to carry";
+    const std::string state = resplit_state_words(st);
     std::fprintf(stderr, "glm lend: CUDA%d lent whole: CUDA%d now holds layers [%d, %d) (RAM tier %.2f GB pinned of a "
                          "%.2f GB budget, %s; the two tiers' sum %.2f GB); the split %s; %s | quiet %.0f ms, save %.0f ms "
                          "(%.1f MB), destroy %.0f ms, load %.0f ms, link %.0f ms, restore %.0f ms, release %.0f ms, %.1f s "
@@ -654,7 +840,8 @@ bool Glm5Model::lend_whole_run(const WholePlan& plan, std::string& err) {
                  ldev, ndev, merged.l0, merged.l1, (double) npp->fast_->ram_bytes / 1073741824.0,
                  (double) merged.ram / 1073741824.0, ram_bound_name(plan.ram_bound),
                  (double) (plan.lo.ram + plan.hi.ram) / 1073741824.0, resplit_where().c_str() + 7, state.c_str(),
-                 t_quiet, t_save, (double) slot.size() / 1048576.0, t_destroy, t_load, t_link, t_restore, t_release,
+                 t_quiet, t_save, (double) (st.snap.size() + st.live.size()) / 1048576.0, t_destroy, t_load, t_link,
+                 t_restore, t_release,
                  ms_since(t_all) / 1000.0);
     return true;
 }
@@ -733,21 +920,15 @@ bool Glm5Model::lend_whole_return(const WholePlan& plan, std::string& err) {
     }
     const double t_quiet = ms_since(t_all);
 
-    // ---- save
+    // ---- save (as the lend's)
     const auto t1 = clock::now();
-    std::vector<uint8_t> slot;
-    int64_t n_pos = -1;
-    bool have_state = snap_pos_ >= 0;
-    for (Glm5Model* m : chain) have_state = have_state && m->snap_pos_ == snap_pos_;
-    if (have_state) {
-        std::string e;
-        if (slot_save(slot, e) == 0) {
-            err = "glm lend: the conversation state did not save: " + e;
-            leave_card(ldev, dev_);
-            return false;
-        }
-        n_pos = snap_pos_;
+    if (seq_count() > 1) seq_bind_all(seq_bound());
+    ResplitState st;
+    if (!resplit_state_save(st, err)) {
+        leave_card(ldev, dev_);
+        return false;
     }
+    const bool have_state = st.snap_pos >= 0;
     const double t_save = ms_since(t1);
 
     // the device lists: the split as it is (the rebuild's) and as it was (the two parts')
@@ -795,7 +976,7 @@ bool Glm5Model::lend_whole_return(const WholePlan& plan, std::string& err) {
         prev->split_next_ = std::move(np);
         std::string e;
         if (!resplit_finish({npp}, e)) fatal("the rebuilt merged split did not finish: " + e);
-        if (!have_state || !slot_load(slot, n_pos, e)) {
+        if (!have_state || !resplit_state_load(st, e)) {
             reset();
             for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->snap_pos_ = -1;
         }
@@ -823,7 +1004,7 @@ bool Glm5Model::lend_whole_return(const WholePlan& plan, std::string& err) {
     const auto t5 = clock::now();
     if (have_state) {
         std::string e;
-        if (!slot_load(slot, n_pos, e)) {
+        if (!resplit_state_load(st, e)) {
             std::fprintf(stderr, "glm lend: the conversation state did not load back onto the returned split (%s): the "
                                  "next request reads its prompt again\n", e.c_str());
             reset();
@@ -842,16 +1023,16 @@ bool Glm5Model::lend_whole_return(const WholePlan& plan, std::string& err) {
 
     const Glm5Model* lp = plan.lo.dev == ldev ? ap : bp;
     const Glm5Model* op = plan.lo.dev == ldev ? bp : ap;
-    const std::string state = have_state ? "the conversation state at " + std::to_string(n_pos) + " positions carried over"
-                                         : "no conversation state to carry";
+    const std::string state = resplit_state_words(st);
     std::fprintf(stderr, "glm lend: CUDA%d returned: it holds layers [%d, %d) again (RAM tier %.2f GB), CUDA%d layers "
                          "[%d, %d) (RAM tier %.2f GB), whole-lendable %s; the split %s; %s | quiet %.0f ms, save %.0f ms "
                          "(%.1f MB), destroy %.0f ms, load %.0f ms, link %.0f ms, restore %.0f ms, check %.0f ms, %.1f s "
                          "in all\n",
                  ldev, lp->l0_, lp->l1_, (double) lp->fast_->ram_bytes / 1073741824.0, op->dev_, op->l0_, op->l1_,
                  (double) op->fast_->ram_bytes / 1073741824.0, whole_mib(ldev) > 0 ? "again" : "NOT (see above)",
-                 resplit_where().c_str() + 7, state.c_str(), t_quiet, t_save, (double) slot.size() / 1048576.0,
-                 t_destroy, t_load, t_link, t_restore, t_check, ms_since(t_all) / 1000.0);
+                 resplit_where().c_str() + 7, state.c_str(), t_quiet, t_save,
+                 (double) (st.snap.size() + st.live.size()) / 1048576.0, t_destroy, t_load, t_link, t_restore, t_check,
+                 ms_since(t_all) / 1000.0);
     return true;
 }
 

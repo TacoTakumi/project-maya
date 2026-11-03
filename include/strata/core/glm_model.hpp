@@ -741,6 +741,17 @@ public:
     using SlotCopy = std::function<bool(uint64_t at, float* dst, int64_t floats)>;
     bool slot_load_from(const Glm5SlotLayout::Read& read, uint64_t size, const SlotCopy& copy, int64_t n_pos,
                         std::string& err);
+    // the conversation state a whole-card re-split carries (src/core/glm_resplit.cu): the snapshot's slot, and the
+    // live state's slot too when a decode stopped at a token past the snapshot (every part at that position) - the
+    // decode goes on from it after the re-split.  The restore loads the live slot, then puts the snapshot's own
+    // records (its KDA states and open pool rows, snap_from_slot) back under it
+    struct ResplitState {
+        std::vector<uint8_t> snap, live;
+        int64_t snap_pos = -1, live_pos = -1;
+    };
+    bool resplit_state_save(ResplitState& st, std::string& err);         // every part quiet; st empty: nothing to carry
+    bool resplit_state_load(const ResplitState& st, std::string& err);   // onto the chain as it stands now
+    bool snap_from_slot(const std::vector<uint8_t>& slot, int64_t n_pos, std::string& err);
     void snap_pool_copy(bool restore);
     int64_t snap_pos_ = -1;
     std::vector<std::vector<float>> ckpt_buf_;             // ckpt_save's checkpoints (this half): KDA runs, pool rows

@@ -1234,6 +1234,13 @@ static int glm_pack_generate(const Options& o) {
     // that decodes or reads its prompt sees them as it sees a STOP; the main thread answers them (they touch the expert
     // slots), never the reader
     strata::core::LendQueue lend_q;
+    // the whole-card changes (LEND <dev> ALL, and the RETURN of a whole-card lease) re-split the model: they run only
+    // where the engine is idle or where the one running decode stopped at a token for them.  Elsewhere - a prompt
+    // being read, several requests running (--parallel), a decode under --spec-follow - they wait here, and so does
+    // every lend command behind them: the answers go out in the order the commands came (the server pairs them by
+    // that order), so nothing overtakes a waiting one
+    std::deque<std::string> lend_held;
+    std::set<std::string> whole_leases;   // the open whole-card leases' ids (the LENT answers to LEND ALL)
     if (o.serve) {
         std::thread([&] {
             std::string l, buf;
@@ -1313,8 +1320,15 @@ static int glm_pack_generate(const Options& o) {
         model.lane_drift_check();
         model.lane_retime();
         std::unique_lock<std::mutex> lk(in_mu);
-        in_cv.wait(lk, [&] { return lend_q.waiting() || !in_lines.empty() || in_eof || quit_req.load(); });
-        if (lend_q.take(out)) return true;
+        in_cv.wait(lk, [&] {
+            return !lend_held.empty() || lend_q.waiting() || !in_lines.empty() || in_eof || quit_req.load();
+        });
+        for (std::string l; lend_q.take(l);) lend_held.push_back(l);   // (behind the ones held: their order)
+        if (!lend_held.empty()) {
+            out = std::move(lend_held.front());
+            lend_held.pop_front();
+            return true;
+        }
         if (in_lines.empty()) return false;   // EOF or QUIT with nothing queued behind it
         out = std::move(in_lines.front());
         in_lines.pop_front();
@@ -1325,17 +1339,47 @@ static int glm_pack_generate(const Options& o) {
     // outside a prompt-path call, so they never land inside a T or PP line
     const std::unique_ptr<strata::core::VramLender> lender = strata::core::make_glm_lender(model);
     strata::core::LendCommands lends(*lender);
-    const auto lend_reply = [&](const std::string& l) {
+    // a whole-card change: LEND <dev> ALL, or the RETURN of a whole-card lease (vram_lend.hpp's lines)
+    const auto lend_whole_change = [&](const std::string& l) {
+        std::istringstream ls(l);
+        std::string c, a, b;
+        ls >> c >> a >> b;
+        return (c == "LEND" && b == "ALL") || (c == "RETURN" && whole_leases.count(a) > 0);
+    };
+    // the answer out; true when the command was a whole-card change (the model was re-split, or an attempt was made)
+    const auto lend_reply = [&](const std::string& l) -> bool {
+        const bool whole = lend_whole_change(l);
         std::string reply;
         lends.handle(l, reply);
         std::fputs(reply.c_str(), stdout);
         std::fflush(stdout);
+        std::istringstream ls(l), rs(reply);
+        std::string c, a, b, r0, r1;
+        ls >> c >> a >> b;
+        rs >> r0 >> r1;
+        if (c == "LEND" && b == "ALL" && r0 == "LENT") whole_leases.insert(r1);
+        if (c == "RETURN" && r0 == "RETURNED") whole_leases.erase(a);
+        return whole;
     };
-    // every waiting lend command - only where nothing is in flight on any part: idle, between two prompt-path calls,
-    // after a decode stopped for them (run_request), after the scheduler's drain (several conversations)
-    const auto serve_lends = [&] {
-        for (std::string l; lend_q.take(l);) lend_reply(l);
+    // the several-conversation scheduler's bookkeeping after a whole-card change (set below, where its contexts are)
+    std::function<void()> lend_after_whole;
+    const auto lend_serve = [&](const std::string& l) {
+        if (lend_reply(l) && lend_after_whole) lend_after_whole();
     };
+    // every waiting lend command, in order - only where nothing is in flight on any part: idle, between two
+    // prompt-path calls, after a decode stopped for them (run_request), after the scheduler's drain (several
+    // conversations).  whole_ok: a whole-card change may run here too (idle, or the one decode stopped at a token);
+    // else it waits, and the commands behind it with it
+    const auto serve_lends = [&](bool whole_ok) {
+        for (std::string l; lend_q.take(l);) lend_held.push_back(l);
+        while (!lend_held.empty()) {
+            if (!whole_ok && lend_whole_change(lend_held.front())) break;
+            const std::string l = std::move(lend_held.front());
+            lend_held.pop_front();
+            lend_serve(l);
+        }
+    };
+    const auto lends_waiting = [&] { return lend_q.waiting() || !lend_held.empty(); };
 
     std::vector<int32_t> snap_tokens;   // the prompt prefix the model's saved state belongs to (conversation reuse)
     // images (GENI): this request's <|image|> positions and rows, and a hash of the rows the saved state read - the
@@ -2006,8 +2050,9 @@ static int glm_pack_generate(const Options& o) {
                 // the lend commands that came during the last call, before the next: between two calls the pool's
                 // tail is back and nothing is in flight (a gap or an interleave round drained what it issued), so a
                 // lend waits one call at most - a piece, a segment between checkpoints (STRATA_GLM_CKPT_EVERY), or the
-                // whole prompt where nothing cuts it
-                serve_lends();
+                // whole prompt where nothing cuts it.  A whole-card change waits: the state here is a prompt half
+                // read, and the decode's first token is the place it runs (the token stop)
+                serve_lends(false);
                 const size_t seg_end = mi < marks.size() ? marks[mi] : snap_at;
                 size_t piece = prompt_piece ? prompt_piece() : 0;
                 if (piece > 0 && interleave.exact) {
@@ -2377,9 +2422,10 @@ static int glm_pack_generate(const Options& o) {
                 return false;
             }
             if (produced >= max_new) return false;
-            if (lend_stops && lend_q.waiting()) {
-                for (std::string l; lend_q.take_lendable(l);) lend_reply(l);   // (only reads: no stop for it)
-                if (lend_q.waiting()) {
+            if (lend_stops && lends_waiting()) {
+                if (lend_held.empty())
+                    for (std::string l; lend_q.take_lendable(l);) lend_reply(l);   // (only reads: no stop for it)
+                if (lends_waiting()) {
                     lend_stop = true;
                     return false;
                 }
@@ -2497,7 +2543,10 @@ static int glm_pack_generate(const Options& o) {
                 }
             }
             if (!lend_stop) break;
-            serve_lends();   // (the decode returned: its streams drained, nothing in flight)
+            // the decode returned: its streams drained, nothing in flight.  A whole-card change runs here too: the
+            // re-split carries the live state at this token (lend_whole_run), and the window's crew comes up again
+            // for the new chain at the next window
+            serve_lends(true);
             if (!lend_resume(err)) {
                 drop_if_poisoned(prompt, err);
                 std::printf("ERR %s\n", err.c_str());
@@ -2632,6 +2681,22 @@ static int glm_pack_generate(const Options& o) {
         ckpt_base = c * ckpt_max;   // (one conversation, or none kept: 0)
         model.seq_bind_all(c);   // (the pipelined decode binds the model's sequences itself)
     };
+    // a whole-card re-split (LEND ALL, its RETURN) runs with every request ended and carries the state of the
+    // sequence the model's head is bound to alone: the other conversations' states lived on the destroyed parts
+    // too, so their prefix caches are forgotten and their sequences reset - the next turn of each reads its prompt
+    // again.  (After an attempt that failed as well: whether the parts were destroyed and rebuilt is not told apart)
+    if (multi)
+        lend_after_whole = [&] {
+            const int keep = model.seq_bound();
+            for (int c = 0; c < (int) ctxs.size(); ++c) {
+                if (c == keep) continue;
+                bind_ctx(c);
+                snap_tokens.clear();
+                snap_in_slot = false;
+                model.reset();
+            }
+            bind_ctx(keep);
+        };
     struct Gen {
         int rid = -1, ctx = 0;
         strata::kernels::SamplerParams sp;
@@ -2704,7 +2769,7 @@ static int glm_pack_generate(const Options& o) {
     strata::core::Glm5Model::FastStats multi_st1;
     uint64_t multi_spec0 = 0, multi_hits0 = 0, multi_mtp_acc = 0, multi_mtp_off = 0;   // (the drafts since then, for the STAT lines)
     const auto input_pending = [&]() -> bool {
-        if (lend_q.waiting()) return true;   // (a lend command: the loop's top answers it, after the drain)
+        if (lends_waiting()) return true;   // (a lend command: the loop's top answers it, after the drain)
         std::lock_guard<std::mutex> lk(in_mu);
         return !in_lines.empty() || quit_req.load();
     };
@@ -3341,7 +3406,8 @@ static int glm_pack_generate(const Options& o) {
                     forced_unused = g.force;
                     g.force = -1;
                 }
-                for (std::string l; lend_q.take_lendable(l);) lend_reply(l);   // (only reads: no stop for it)
+                if (lend_held.empty())
+                    for (std::string l; lend_q.take_lendable(l);) lend_reply(l);   // (only reads: no stop for it)
                 if (input_pending()) {
                     interrupted = true;
                     return false;
@@ -4248,13 +4314,15 @@ static int glm_pack_generate(const Options& o) {
         // issued token and window taken back first (multi_drain), so nothing is in flight on any part.  The decode
         // steps of a prompt being read come back here only once its read has ended; between its calls prep_prompt
         // answers them
-        if (lend_q.waiting()) {
-            if (multi && !gens.empty()) {
+        if (lends_waiting()) {
+            if (multi && !gens.empty() && lend_q.waiting()) {
                 if (!multi_drain()) multi_fail(err);
                 if (std::any_of(gens.begin(), gens.end(), [](const std::unique_ptr<Gen>& p) { return p->done; }))
                     gen_sweep();
             }
-            serve_lends();
+            // a whole-card change only with every request ended (several conversations: their states live on the
+            // parts the re-split destroys); it waits here until then, within the server's wait for it
+            serve_lends(!multi || (gens.empty() && pending.empty()));
         }
         if (multi && !pending.empty()) admit_pending();
         if (multi && !gens.empty()) {   // requests running: a line when one is there, else one scheduler step
@@ -4270,7 +4338,7 @@ static int glm_pack_generate(const Options& o) {
             break;
         }
         if (strata::core::lend_line_kind(line) != strata::core::LendLineKind::none) {   // (idle: next_line's)
-            lend_reply(line);
+            lend_serve(line);
             continue;
         }
         std::istringstream ss(line);
