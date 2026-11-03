@@ -25,11 +25,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 # The stand-in engine: three VRAM lines (card 2 does not lend), READY, then GEN (ids + 1000, one token every 30 ms, on a
 # thread: the command loop reads on meanwhile), STOP, QUIT and the lend commands with the engines' answers.  Cards lend
-# in 64 MiB blocks (a lend is rounded up).  FAKE_LEND=0: an engine without lending (the "unsupported command" ERR);
+# in 64 MiB blocks (a lend is rounded up); card 1 can also be lent whole (LEND 1 ALL: its footprint of 15360 MiB, the
+# whole= figure of its LENDABLE line) - never while a lease of either kind is open on it, and while its whole-card lease
+# is open its lendable and whole= are 0.  FAKE_LEND=0: an engine without lending (the "unsupported command" ERR);
 # FAKE_MULTI=<n>: several conversations (READY ... multi=<n>, the lines tagged with rid); FAKE_BUSY=<n>: the first n
-# RETURNs answer ERR BUSY; FAKE_SLOW=<n>: the first n LENDs are answered 1.2 s late (the command loop waits, as an
-# engine's does while it reads a long prompt: the commands behind them wait too); FAKE_LOG: every line it reads, one a
-# line.
+# RETURNs answer ERR BUSY; FAKE_SLOW=<n>: the first n LENDs are answered late, by FAKE_SLOW_S seconds (1.2; the command
+# loop waits, as an engine's does while it reads a long prompt: the commands behind them wait too); FAKE_LOG: every
+# line it reads, one a line.
 STAND_IN = r'''
 import os, re, sys, threading, time
 
@@ -37,10 +39,12 @@ lend_on = os.environ.get("FAKE_LEND", "1") == "1"
 multi = int(os.environ.get("FAKE_MULTI", "0") or 0)
 busy = [int(os.environ.get("FAKE_BUSY", "0") or 0)]
 slow = [int(os.environ.get("FAKE_SLOW", "0") or 0)]
+slow_s = float(os.environ.get("FAKE_SLOW_S", "1.2") or 1.2)
 log = os.environ.get("FAKE_LOG")
 pool = {0: 4096, 1: 2048}                            # dev -> what it can lend with nothing out (MiB)
+whole = {1: 15360}                                   # dev -> its whole-card footprint (absent: not whole-lendable)
 block = 64
-leases, next_id = {}, [7]
+leases, next_id = {}, [7]                            # id -> (dev, mib, whole)
 lock = threading.Lock()
 stop = threading.Event()
 
@@ -52,7 +56,15 @@ def out(s):
 
 
 def lent(dev):
-    return sum(m for d, m in leases.values() if d == dev)
+    return sum(m for d, m, _ in leases.values() if d == dev)
+
+
+def whole_open(dev):
+    return any(d == dev and w for d, _, w in leases.values())
+
+
+def lendable(dev):
+    return 0 if whole_open(dev) else pool[dev] - lent(dev)
 
 
 def gen(f, rid):
@@ -70,18 +82,25 @@ def lend_cmd(f):
     if f[0] == "LENDABLE":
         if len(f) != 1:
             return ["ERR MALFORMED LENDABLE"]
-        return [f"LENDABLE dev={d} lendable={pool[d] - lent(d)} lent={lent(d)}" for d in sorted(pool)] + ["END"]
+        return [f"LENDABLE dev={d} lendable={lendable(d)} lent={lent(d)} "
+                f"whole={0 if whole_open(d) else whole.get(d, 0)}" for d in sorted(pool)] + ["END"]
     if f[0] == "LEND":
-        if len(f) != 3 or not f[1].isdigit() or not f[2].isdigit() or int(f[2]) == 0:
+        if len(f) != 3 or not f[1].isdigit() or not (f[2] == "ALL" or f[2].isdigit() and int(f[2]) > 0):
             return ["ERR MALFORMED LEND <dev> <mib>"]
-        dev, mib = int(f[1]), -(-int(f[2]) // block) * block
+        dev = int(f[1])
         if dev not in pool:
             return [f"ERR NODEV {dev}"]
-        if mib > pool[dev] - lent(dev):
-            return [f"ERR MAX {pool[dev] - lent(dev)}"]
+        if f[2] == "ALL":
+            if not whole.get(dev) or lent(dev):
+                return [f"ERR MAX {lendable(dev)}"]
+            mib = whole[dev]
+        else:
+            mib = -(-int(f[2]) // block) * block
+            if mib > lendable(dev):
+                return [f"ERR MAX {lendable(dev)}"]
         i = next_id[0]
         next_id[0] += 5
-        leases[i] = (dev, mib)
+        leases[i] = (dev, mib, f[2] == "ALL")
         return [f"LENT {i} {dev} {mib}"]
     if len(f) != 2:
         return ["ERR MALFORMED RETURN <id>"]
@@ -122,7 +141,7 @@ for line in sys.stdin:
             continue
         if f[0] == "LEND" and slow[0] > 0:
             slow[0] -= 1
-            time.sleep(1.2)
+            time.sleep(slow_s)
         for a in lend_cmd(f):
             out(a)
         continue
@@ -255,7 +274,7 @@ class Routes(LendBase):
     def test_state_shape(self):
         st = self.state()
         self.assertEqual(st, {"gpus": [{"gpu": "0000:01:00.0", "lendable": 4096, "lent": 0},
-                                        {"gpu": "0000:0a:00.0", "lendable": 2048, "lent": 0},
+                                        {"gpu": "0000:0a:00.0", "lendable": 2048, "lent": 0, "whole_mib": 15360},
                                         {"gpu": "0000:0b:00.0", "lendable": 0, "lent": 0}],
                               "leases": []})
         code, a = self.lend("0000:01:00.0", 512)
@@ -424,12 +443,172 @@ class LateAnswers(LendBase):
         self.assertEqual(self.lend("0000:01:00.0", 64)[0], 503)
         self.svc.vram_lend.answer_s = 10
         st = self.state()
-        self.assertEqual(self.gpu(st, "0000:0a:00.0"), {"gpu": "0000:0a:00.0", "lendable": 2048, "lent": 0})
+        self.assertEqual(self.gpu(st, "0000:0a:00.0"),
+                         {"gpu": "0000:0a:00.0", "lendable": 2048, "lent": 0, "whole_mib": 15360})
         first = self.gpu(st, "0000:01:00.0")
         self.assertEqual(first["lendable"] + first["lent"], 4096)
         self.assertEqual(sum(x["mib"] for x in st["leases"]), first["lent"])   # listed while the engine lends it
         st = self.given_back()
         self.assertEqual(self.gpu(st, "0000:01:00.0"), {"gpu": "0000:01:00.0", "lendable": 4096, "lent": 0})
+
+
+class WholeCard(LendBase):
+    """Lending a whole GPU: "all" or a number above its lendable and at most its whole_mib send LEND <dev> ALL; the
+    two kinds of lease never share a GPU, and the server refuses the mixes itself, before the engine sees a LEND."""
+    WHOLE = 15360
+    CARD = "0000:0a:00.0"                             # whole-lendable: lendable 2048, whole_mib 15360
+    POOL = "0000:01:00.0"                             # lends from its pool only (lendable 4096)
+
+    def test_state_shows_whole_mib_on_the_whole_lendable_card_only(self):
+        st = self.state()
+        self.assertEqual(self.gpu(st, self.CARD), {"gpu": self.CARD, "lendable": 2048, "lent": 0,
+                                                   "whole_mib": self.WHOLE})
+        for pci in (self.POOL, "0000:0b:00.0"):
+            self.assertNotIn("whole_mib", self.gpu(st, pci), pci)
+
+    def check_whole_lend(self, mib):
+        code, out = self.lend(self.CARD, mib)
+        self.assertEqual(code, 200, (mib, out))
+        self.assertEqual(set(out), {"id", "gpu", "mib"})
+        self.assertEqual((out["gpu"], out["mib"]), (self.CARD, self.WHOLE))
+        self.assertEqual(self.engine_lines("LEND"), ["LEND 1 ALL"])
+        st = self.state()
+        self.assertEqual(self.gpu(st, self.CARD), {"gpu": self.CARD, "lendable": 0, "lent": self.WHOLE})
+        self.assertEqual(st["leases"], [{"id": out["id"], "gpu": self.CARD, "mib": self.WHOLE}])
+        self.assertEqual(self.gpu(st, self.POOL), {"gpu": self.POOL, "lendable": 4096, "lent": 0})
+        code, back = self.give_back(out["id"])
+        self.assertEqual(code, 200, back)
+        self.assertEqual(back, out)
+        st = self.state()
+        self.assertEqual(st["leases"], [])
+        self.assertEqual(self.gpu(st, self.CARD), {"gpu": self.CARD, "lendable": 2048, "lent": 0,
+                                                   "whole_mib": self.WHOLE})
+
+    def test_all_lends_the_whole_card(self):
+        self.check_whole_lend("all")
+
+    def test_a_number_above_lendable_lends_the_whole_card(self):
+        self.check_whole_lend(2049)
+
+    def test_whole_mib_itself_lends_the_whole_card(self):
+        self.check_whole_lend(self.WHOLE)
+
+    def test_lendable_itself_is_a_pool_lend(self):
+        code, out = self.lend(self.CARD, 2048)
+        self.assertEqual(code, 200, out)
+        self.assertEqual(out["mib"], 2048)
+        self.assertEqual(self.engine_lines("LEND"), ["LEND 1 2048"])
+
+    def test_all_on_a_card_without_whole_mib_is_409_with_its_lendable(self):
+        before = self.state()
+        code, out = self.lend(self.POOL, "all")
+        self.assertEqual((code, out), (409, {"max_mib": 4096}))
+        code, out = self.lend("0000:0b:00.0", "all")
+        self.assertEqual((code, out), (409, {"max_mib": 0}))
+        self.assertEqual(self.engine_lines("LEND"), [])
+        self.assertEqual(self.state(), before)
+
+    def test_a_number_above_whole_mib_is_409_with_whole_mib(self):
+        before = self.state()
+        code, out = self.lend(self.CARD, self.WHOLE + 1)
+        self.assertEqual((code, out), (409, {"max_mib": self.WHOLE}))
+        code, out = self.lend(self.CARD, 10 ** 9)
+        self.assertEqual((code, out), (409, {"max_mib": self.WHOLE}))
+        self.assertEqual(self.engine_lines("LEND"), [])
+        self.assertEqual(self.state(), before)
+
+    def test_bad_mib_is_400(self):
+        for mib in (True, "ALL ", 0, -1, "All", "all ", " all", "ALL", "2049", 2049.0):
+            code, out = self.lend(self.CARD, mib)
+            self.assertEqual(code, 400, (mib, out))
+            self.assertIn("error", out)
+        self.assertEqual(self.engine_lines("LEND"), [])
+
+    def test_whole_lend_is_refused_while_a_pool_lease_is_open(self):
+        code, a = self.lend(self.CARD, 64)
+        self.assertEqual(code, 200, a)
+        before = self.state()
+        self.assertEqual(self.gpu(before, self.CARD), {"gpu": self.CARD, "lendable": 1984, "lent": 64,
+                                                       "whole_mib": self.WHOLE})
+        for mib in ("all", 2049, self.WHOLE):
+            code, out = self.lend(self.CARD, mib)
+            self.assertEqual((code, out), (409, {"max_mib": 1984}), mib)
+        self.assertEqual(self.engine_lines("LEND"), ["LEND 1 64"])          # the engine saw no whole lend
+        self.assertEqual(self.state(), before)
+        self.assertEqual(self.give_back(a["id"])[0], 200)
+        self.assertEqual(self.lend(self.CARD, "all")[0], 200)              # free again: the whole card goes
+
+    def test_pool_lend_is_refused_while_the_whole_lease_is_open(self):
+        code, a = self.lend(self.CARD, "all")
+        self.assertEqual(code, 200, a)
+        before = self.state()
+        self.assertEqual(self.gpu(before, self.CARD), {"gpu": self.CARD, "lendable": 0, "lent": self.WHOLE})
+        for mib in (1024, 64, 2049, "all"):
+            code, out = self.lend(self.CARD, mib)
+            self.assertEqual((code, out), (409, {"max_mib": 0}), mib)
+        self.assertEqual(self.engine_lines("LEND"), ["LEND 1 ALL"])         # nothing more went to the engine
+        self.assertEqual(self.state(), before)
+        self.assertEqual(self.lend(self.POOL, 64)[0], 200)                 # another card lends as before
+        self.assertEqual(self.give_back(a["id"])[0], 200)
+        self.assertEqual(self.lend(self.CARD, 1024)[0], 200)
+
+
+class LateWholeAnswers(LendBase):
+    """The engine answers a LEND "45 s" late: past a pool lend's 30 s wait (503, and the server gives the late lease
+    back) but inside a whole-card lend's 180 s (200).  The seconds are scaled: the stand-in answers after 1.2 s and the
+    two waits are set to 0.8 s and 4.8 s - the same ratios as 45 s against 30 s and 180 s."""
+    env = {"FAKE_SLOW": "1", "FAKE_SLOW_S": "1.2"}
+
+    def setUp(self):
+        super().setUp()
+        self.svc.vram_lend.answer_s = 0.8
+        self.svc.vram_lend.whole_answer_s = 4.8
+
+    def returned(self, n=1):
+        end = time.monotonic() + 10
+        while time.monotonic() < end:
+            if len(self.engine_lines("RETURN")) >= n and not self.state()["leases"]:
+                return
+            time.sleep(0.05)
+        self.fail(f"the late lease did not go back: {self.engine_lines('RETURN')}, {self.state()}")
+
+    def test_a_pool_lend_answered_at_45_s_is_503_and_given_back(self):
+        code, out = self.lend("0000:0a:00.0", 64)
+        self.assertEqual(code, 503, out)
+        self.assertIn("give it back", out["error"])
+        self.returned()
+        self.assertEqual(self.engine_lines("RETURN"), ["RETURN 7"])
+        self.assertEqual(self.gpu(self.state(), "0000:0a:00.0"),
+                         {"gpu": "0000:0a:00.0", "lendable": 2048, "lent": 0, "whole_mib": 15360})
+
+    def test_a_whole_lend_answered_at_45_s_is_200(self):
+        t0 = time.monotonic()
+        code, out = self.lend("0000:0a:00.0", "all")
+        self.assertEqual(code, 200, out)
+        self.assertGreater(time.monotonic() - t0, 1.0)
+        self.assertEqual((out["gpu"], out["mib"]), ("0000:0a:00.0", 15360))
+        self.assertEqual(self.engine_lines("LEND"), ["LEND 1 ALL"])
+        self.assertEqual(self.engine_lines("RETURN"), [])
+        st = self.state()
+        self.assertEqual(st["leases"], [{"id": out["id"], "gpu": "0000:0a:00.0", "mib": 15360}])
+        self.assertEqual(self.gpu(st, "0000:0a:00.0"), {"gpu": "0000:0a:00.0", "lendable": 0, "lent": 15360})
+        self.assertEqual(self.give_back(out["id"])[0], 200)
+
+    def test_a_whole_lend_past_its_own_wait_is_given_back(self):
+        self.svc.vram_lend.whole_answer_s = 0.5
+        code, out = self.lend("0000:0a:00.0", "all")
+        self.assertEqual(code, 503, out)
+        self.assertIn("give it back", out["error"])
+        self.returned()
+        self.assertEqual(self.engine_lines("RETURN"), ["RETURN 7"])
+        self.assertEqual(self.gpu(self.state(), "0000:0a:00.0"),
+                         {"gpu": "0000:0a:00.0", "lendable": 2048, "lent": 0, "whole_mib": 15360})
+
+    def test_the_default_waits(self):
+        from serve import vram_lend
+        self.assertEqual((vram_lend.POOL_WAIT_S, vram_lend.WHOLE_WAIT_S), (30.0, 180.0))
+        lender = vram_lend.Lender()
+        self.assertEqual((lender.answer_s, lender.whole_answer_s), (30.0, 180.0))
 
 
 class WhileRequestsRun(LendBase):
@@ -527,6 +706,7 @@ class Answers(unittest.TestCase):
     def test_is_answer(self):
         from serve import vram_lend
         for line in ("LENT 7 0 128\n", "RETURNED 7\n", "LENDABLE dev=0 lendable=4096 lent=0\n", "END\n",
+                     "LENDABLE dev=1 lendable=2048 lent=0 whole=15360\n",
                      "ERR MAX 4096\n", "ERR NODEV 3\n", "ERR BUSY 7\n", "ERR UNKNOWN x9\n",
                      "ERR MALFORMED LEND <dev> <mib>\n", "ERR MALFORMED RETURN <id>\n", "ERR MALFORMED LENDABLE\n",
                      "ERR unsupported command 'LEND' (GEN, GENI, STOP and QUIT)\n",
