@@ -57,6 +57,16 @@ __device__ __forceinline__ float __ldcg(const float* p) {
 #endif
 
 namespace strata::kernels::glmf {
+
+// the context generation of each device (glm_fast.hpp): bumped by the engine after a card's cudaDeviceReset
+static std::atomic<unsigned> g_ctx_gen[kDevGenMax];
+unsigned device_context_generation(int dev) {
+    return dev >= 0 && dev < kDevGenMax ? g_ctx_gen[dev].load(std::memory_order_acquire) : 0;
+}
+void device_context_reset(int dev) {
+    if (dev >= 0 && dev < kDevGenMax) g_ctx_gen[dev].fetch_add(1, std::memory_order_acq_rel);
+}
+
 namespace {
 
 // ---------------------------------------------------------------- small helpers
@@ -6372,6 +6382,11 @@ void mla_out(const float* ctx, int64_t ctx_stride, const uint16_t* wv_b, int n_h
 static float* mla_part(int dev, int n_head, int kv_lora, int chunks, int* cap) {
     static float* part[16] = {};
     static int part_chunks[16] = {};
+    static DevGen gen;   // (a new context on the device: the buffer went with the old one - dropped, not freed)
+    if (!gen.keep(dev)) {
+        part[dev] = nullptr;
+        part_chunks[dev] = 0;
+    }
     if (part_chunks[dev] < chunks) {
         if (part[dev]) cudaFree(part[dev]);
         const int want = std::max(chunks, 80);
@@ -6483,6 +6498,11 @@ static bool mla_split_attend(const float* q_abs, const uint16_t* lat, const int*
     static int attr_smem[16] = {};
     static bool split_ok[16] = {true, true, true, true, true, true, true, true,
                                 true, true, true, true, true, true, true, true};
+    static DevGen gen;   // (the opt-in is the context's: set again on a new one)
+    if (!gen.keep(dev)) {
+        attr_smem[dev] = 0;
+        split_ok[dev] = true;
+    }
     if (split_ok[dev] && attr_smem[dev] < (int) smem) {
         if (cudaFuncSetAttribute(mla_split_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem) == cudaSuccess) {
             attr_smem[dev] = (int) smem;
@@ -6536,8 +6556,10 @@ void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint1
     };
     // scratch for q_abs and ctx (n_head * kv_lora each), per device
     static float* scratch[16] = {};
+    static DevGen gen;   // (a new context on the device: the scratch went with the old one - dropped, not freed)
     int dev = 0;
     cudaGetDevice(&dev);
+    if (dev >= 0 && dev < 16 && !gen.keep(dev)) scratch[dev] = nullptr;
     if (getenv("STRATA_GLM_MLA1") != nullptr || dev >= 16 || kv_lora % 32 || v_head % 32) {
         const size_t smem = ((size_t) qk_nope + 2 * kv_lora + v_head + n_sel) * sizeof(float);
         mla_kernel<<<n_head, 256, smem, s>>>(q, wk_b, wv_b, lat, cells, n_sel, qk_nope, kv_lora, v_head,

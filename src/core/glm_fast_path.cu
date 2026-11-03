@@ -1145,6 +1145,24 @@ bool Glm5Model::fast_setup(std::string& err) {
         pool_b_ = part_budget(free_b, total_b, floor_b, stride_max);
         const size_t reserve = pool_b_.reserve;
         size_t avail = pool_b_.avail;
+        // a re-split reload (pool_want_): the budget the part's pool was carved from at the load, so the same slots,
+        // tail, regions and lendable come out again - the free VRAM differs by then (what the process has loaded into
+        // the context since).  Taken while it leaves at least half the reserve free; else the free-VRAM sizing above
+        if (pool_want_ > 0) {
+            const size_t room = free_b > reserve / 2 ? free_b - reserve / 2 : 0;
+            if (pool_want_ <= room) {
+                std::fprintf(stderr, "glm fast: CUDA%d the expert pool carved as before the re-split: budget %zu MiB (the "
+                                     "free VRAM now would give %zu)\n", dev_, pool_want_ >> 20, avail >> 20);
+                avail = pool_want_;
+                pool_b_.avail = pool_want_;   // (the budget this pool IS carved from: the next re-split carries it on)
+            } else {
+                std::fprintf(stderr, "glm fast: CUDA%d the expert pool as before the re-split (%zu MiB) does not fit the "
+                                     "card now (%zu MiB free, %zu MiB kept of the %zu MiB reserve): sized from the free "
+                                     "VRAM, %zu MiB\n", dev_, pool_want_ >> 20, free_b >> 20, (reserve / 2) >> 20,
+                             reserve >> 20, avail >> 20);
+                pool_block_want_ = 0;
+            }
+        }
         if (pool_b_.adapted)
             std::fprintf(stderr, "glm fast: CUDA%d the default %d MiB VRAM reserve leaves the expert pool too few slots "
                                  "on this card: a %zu MiB reserve instead\n", dev_, 700, reserve >> 20);
@@ -1414,6 +1432,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         {
             strata::core::VramPool::Options po;
             po.tag = "glm fast";
+            if (pool_block_want_ > 0) po.block_bytes = pool_block_want_;   // (a re-split reload: the block as before)
             for (int attempt = 0;; ++attempt) {
                 std::vector<strata::core::VramPoolRegion> regions;
                 for (int il : order) regions.push_back({slot_stride(il), nsl[(size_t) il] - k_extra});

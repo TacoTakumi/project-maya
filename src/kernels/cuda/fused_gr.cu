@@ -1,6 +1,7 @@
 // src/kernels/cuda/fused_gr.cu - see include/strata/kernels/fused_gr.hpp.
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/glm_fast.hpp"   // (glmf::DevGen: the per-device opt-in below is the context's)
 #include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
@@ -326,8 +327,10 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     // runs this kernel on two cards)
     static bool attr[64] = {};
     static int chunk[64] = {};   // Turing port: tokens the down kernel may carry in one launch on this card
+    static glmf::DevGen gen;     // (the opt-in is set again on a new context; `chunk` is the card's, it stays)
     int dev = 0;
     cudaGetDevice(&dev);
+    if (!gen.keep(dev)) attr[dev] = false;
     if (dev >= 0 && dev < 64 && !attr[dev]) {
         // at most what the card allows (Turing: 64 KB - enough for windows of up to 6 tokens)
         int optin = 0;

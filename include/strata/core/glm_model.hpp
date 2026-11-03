@@ -231,11 +231,35 @@ public:
     /// the footprint the lend releases.  False + err: the card is not whole-lendable now (lend_whole_check did not
     /// pass it, the room is gone, several conversations are set up).  Nothing changes.
     struct WholePlan {
-        Glm5Model* lent = nullptr;   // the part on the card
-        Glm5Model* into = nullptr;   // the adjacent part that takes its layers
+        Glm5Model* lent = nullptr;   // the part on the card (the lend's; gone once it ran)
+        Glm5Model* into = nullptr;   // the adjacent part that takes its layers (gone too: loaded again merged)
         uint64_t mib = 0;            // the footprint released (whole_mib(dev))
+        int dev = -1;                // the card lent
+        // what the return loads again (lend_whole_return): the two parts as they were, in chain order - the device,
+        // the layers and the pinned RAM tier each had - and the part count the load ran with, which the CPU lane's
+        // shared pool is sized from (a part loaded with another count would open a second pool beside it)
+        struct Part {
+            int dev = 0, l0 = 0, l1 = 0;
+            int64_t ram = -1;
+            // the expert pool as the part had it: the budget it was carved from (PoolBudget::avail - the figure the
+            // carve consumes, so the same slots, tail and regions come out of it) and its block; 0: size the pool from
+            // the free VRAM as at a load (the lend's merged part: nothing to copy from)
+            uint64_t pool = 0, block = 0;
+        };
+        Part lo, hi;
+        int n_parts = 0;
     };
     bool lend_whole_plan(int dev, WholePlan& plan, std::string& err);
+    /// The return's room check, before anything changes: the lent card's free VRAM (cudaMemGetInfo under it, which
+    /// brings the primary context back - released again when the answer is no) against the footprint the part had
+    /// (plan.mib).  False + why: another process still holds the card, with the figures; the lease stays open.
+    bool lend_whole_room(const WholePlan& plan, std::string& why);
+    /// The return (src/core/glm_resplit.cu): the reverse of lend_whole_run - every part quiesced, the state saved, the
+    /// merged part destroyed, the two parts loaded again as they were (plan.lo / plan.hi: their devices, layers and
+    /// RAM tier budgets), linked and finished, the state loaded back, the load's room check run again for the card
+    /// (whole_mib(dev) is set again).  False + err: the return could not start (nothing changed), or a part did not
+    /// load and the merged part was rebuilt (the lease stays open); should the rebuild fail too the engine ends.
+    bool lend_whole_return(const WholePlan& plan, std::string& err);
     /// The lend itself, called on the head part with nothing in flight (make_glm_lender's calling rules): every part
     /// quiesced (background moves held, copies landed, boundaries run, every stream synchronized), the conversation
     /// state saved to RAM (slot_save: the snapshot and the DSA caches, every part), the lent part and the neighbour
@@ -1107,6 +1131,9 @@ public:
     size_t commit_kept_ = 0, commit_limit_ = 0, commit_ram_ = 0;   // (a Windows APU: what the commit kept off, as read)
     PoolBudget pool_b_;                                    // the budget the pool was carved from
     uint64_t whole_mib_ = 0;                               // lend_whole_check's pass: this part's footprint (0: none)
+    // a re-split reload (resplit_make): carve the expert pool as the part had it - this budget (PoolBudget::avail) in
+    // place of the free-VRAM figure while it leaves half the VRAM reserve free, and this block size; 0: as at a load
+    size_t pool_want_ = 0, pool_block_want_ = 0;
     static size_t mmq_scratch_reserve();      // ... of which the prompt path's MMQ scratch pool needs this much
     // the slots a layer must keep while the pool lends the prompt path: one route's experts, the device's spares, +2
     // (Strata's floor); STRATA_GLM_PREFILL_KEEP lowers it, never below route + spares
@@ -1155,6 +1182,14 @@ private:
     // the split's figures for a whole-card lend's room check (src/core/glm_resplit.cu): one ResplitPart per part of
     // the chain from this one, and the parts themselves in the same order
     void resplit_figures(std::vector<ResplitPart>& parts, std::vector<Glm5Model*>& chain);
+    // the steps a whole-card re-split shares between the lend and the return (src/core/glm_resplit.cu): every part
+    // of `chain` quiet with its background moves held (the caller lets go of bg_hold); one part loaded through
+    // load_pack as load_pack_split loads one (nullptr + a log line when it did not); the chain finished as
+    // load_pack_split finishes it, `fresh` the parts just loaded
+    bool resplit_quiet(const std::vector<Glm5Model*>& chain, std::string& err);
+    std::unique_ptr<Glm5Model> resplit_make(const WholePlan::Part& sp, int idx, int n_parts, const std::vector<int>& devs);
+    bool resplit_finish(const std::vector<Glm5Model*>& fresh, std::string& err);
+    std::string resplit_where() const;   // the split's layout as the log lines print it ("layers [a, b) on CUDAn, ...")
     // scratch offsets, in floats into sc_
     int64_t sc_mixed = 0, sc_x = 0, sc_pre = 0, sc_post = 0, sc_comb = 0, sc_inv = 0, sc_proj = 0;
     int64_t sc_emb = 0;

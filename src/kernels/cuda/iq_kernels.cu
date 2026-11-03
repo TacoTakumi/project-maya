@@ -5,6 +5,7 @@
 // MIT license, third_party/ggml/LICENSE).  The block structs and codebook grids come from its ggml-common.h,
 // included unchanged.
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/glm_fast.hpp"   // (glmf::DevGen: the per-device opt-ins below are the context's)
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -1255,7 +1256,9 @@ __global__ void __launch_bounds__(WG_THREADS, MT == 2 ? 2 : 1) gemm_iq_f16_group
 // launch a kernel whose tile was never attributed.
 unsigned gemm_iq_f16_grouped_caps(int dev) {
     static thread_local unsigned per_dev[64];   // per-thread: two prefill objects may first touch one device at once
+    static thread_local strata::kernels::glmf::DevGen gen;       // (the opt-ins are the context's: queried again on a new one)
     if (dev < 0 || dev >= 64) return 0;
+    if (!gen.keep(dev)) per_dev[dev] = 0;
     if (!(per_dev[dev] & 1u)) {
         unsigned caps = 1u;                      // queried
         int major = 0;

@@ -1260,10 +1260,13 @@ bool GlmDflash::draft_start(int32_t anchor, int64_t n_past, int n_max, float p_m
     const int per_split = (chunks + kAttnSplits - 1) / kAttnSplits * kAttnKeys;
     const int splits = (nk_max + per_split - 1) / per_split;
     if (!split && smem > 48 * 1024) {
-        static bool once = false;
-        if (!once) {
-            once = true;
+        // (the opt-in is per device and per context: the drafter's card could be lent whole and come back)
+        static gf::DevGen once;
+        int adev = 0;
+        cudaGetDevice(&adev);
+        if (!once.keep(adev)) {
             cudaFuncSetAttribute(attn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
+            cudaGetLastError();
         }
         if (smem > 96 * 1024) {
             err = "glm dflash: a window of " + std::to_string(nk_max) + " keys";

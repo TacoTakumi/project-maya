@@ -473,4 +473,30 @@ void argmax_pair(const float* x, int n, int* out, cudaStream_t s);
 /// whole row, ties to the lower index.
 void argmax_join(const int* a, const int* b, int c0, int* out, cudaStream_t s);
 
+/// A device's CONTEXT GENERATION.  The engine destroys a card's primary context when it lends the card whole
+/// (cudaDeviceReset, src/core/glm_resplit.cu) and a new one comes with the first allocation when the card comes back.
+/// A kernel file's per-device cache of anything that belongs to a context - a cudaMalloc'd scratch pointer, a
+/// cudaFuncSetAttribute shared-memory opt-in, a __constant__ upload - is stale from the reset on (the first decode on
+/// the returned card read a freed pointer: an illegal memory access that poisoned the context), while a hardware fact
+/// (compute capability, SM count, an occupancy figure) is not.  The engine bumps the generation right after the reset
+/// (device_context_reset); each such cache records the generation it filled an entry under and trusts the entry only
+/// while it matches (DevGen below).  Device ordinals up to kDevGenMax; others read generation 0.
+constexpr int kDevGenMax = 64;
+unsigned device_context_generation(int dev);
+void device_context_reset(int dev);
+/// One per-device cache's record of the generation each entry was filled under.  keep(dev): true when the entry for
+/// dev was filled under the live generation and may be trusted; false when the caller must refill it - the record is
+/// already moved to the live generation, and a device pointer in the entry is dropped, NOT freed (it went with the
+/// context).  Plain words, like the caches themselves (filled from the engine's threads, which take a device each).
+struct DevGen {
+    unsigned filled[kDevGenMax] = {};   // the generation + 1 (0: never filled)
+    bool keep(int dev) {
+        if (dev < 0 || dev >= kDevGenMax) return true;
+        const unsigned now = device_context_generation(dev) + 1;
+        if (filled[dev] == now) return true;
+        filled[dev] = now;
+        return false;
+    }
+};
+
 }  // namespace strata::kernels::glmf

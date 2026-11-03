@@ -35,6 +35,7 @@
 #pragma pop_macro("__shfl_sync")
 #endif
 #endif
+#include "strata/kernels/glm_fast.hpp"   // (glmf::DevGen: the per-device opt-ins below are the context's)
 #include "strata/kernels/glm_batch.hpp"
 #include "dsa_topk.cuh"
 #include "glm_lat8.cuh"
@@ -2380,9 +2381,11 @@ void dsa_score(const float* iq, const float* pooled, const float* iw, int key_di
         // per device (a split's cards each need the shared-memory opt-in; Pascal has no tensor cores): 0 not looked
         // at yet, 1 the tensor-core kernel, -1 the FP32 tiled one
         static int tc_dev[16] = {};
+        static ::strata::kernels::glmf::DevGen gen;   // (the opt-in is the context's: looked at again on a new one)
         int dev = 0;
         cudaGetDevice(&dev);
         if (dev < 0 || dev >= 16) dev = 0;
+        if (!gen.keep(dev)) tc_dev[dev] = 0;
         if (tc_dev[dev] == 0) {
             int major = 0;
             cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
@@ -2437,6 +2440,8 @@ bool mla_decode_v70(const float* q_abs, const uint16_t* lat, const int* cells, i
     if (dev >= 16) return false;
     static int ok[16] = {};
     static int sms[16] = {};
+    static ::strata::kernels::glmf::DevGen gen;   // (the opt-in is the context's: looked at again on a new one)
+    if (!gen.keep(dev)) ok[dev] = 0;
     if (ok[dev] == 0) {
         int major = 0, minor = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
@@ -2493,6 +2498,11 @@ void mla_attn(const float* q_abs, const uint16_t* lat, const int* cells, const i
     static const bool want_reg = attn_mode != nullptr && std::strcmp(attn_mode, "tcreg") == 0;
     static const bool want_wmma = attn_mode != nullptr && std::strcmp(attn_mode, "wmma") == 0;
     static const bool check_tc = getenv("STRATA_GLM_PREFILL_ATTN_CHECK") != nullptr;
+    // the three choices below record cudaFuncSetAttribute opt-ins, which are the context's: chosen again on a new one
+    static ::strata::kernels::glmf::DevGen gen;
+    static int tc2_ok[16] = {};
+    static int v70_ok[16] = {};
+    if (!gen.keep(dev)) tc_ok[dev] = tc2_ok[dev] = v70_ok[dev] = 0;
     if (tc_ok[dev] == 0) {
         int major = 0, minor = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
@@ -2525,7 +2535,6 @@ void mla_attn(const float* q_abs, const uint16_t* lat, const int* cells, const i
         static const bool want_tc2 = attn_mode == nullptr || std::strcmp(attn_mode, "tc") != 0;
         // the shared-memory attribute is per GPU: set on each one (once set only on the first, a split's later GPUs
         // failed the launch and their layers read stale attention)
-        static int tc2_ok[16] = {};
         if (tc2_ok[dev] == 0) {
             tc2_ok[dev] = cudaFuncSetAttribute(mla_attn_tc2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                (int) kT2Smem) == cudaSuccess ? 1 : -1;
@@ -2535,7 +2544,6 @@ void mla_attn(const float* q_abs, const uint16_t* lat, const int* cells, const i
         // the two-pass one.  Maya-S24, one V100: dsa_attn of a 27K prompt 6.87 -> 4.09 s, prompts 2K / 8K / 27K +4 / +9 /
         // +9 %; KL against tc2 0.0119 where the exact F32 kernel's is 0.0124; needles 6 / 6 at 40K and 100K (128K context)
         static const bool want_v70 = attn_mode == nullptr || std::strcmp(attn_mode, "v70") == 0;
-        static int v70_ok[16] = {};
         if (v70_ok[dev] == 0) {
             int major = 0, minor = 0;
             cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
