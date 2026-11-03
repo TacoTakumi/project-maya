@@ -715,6 +715,11 @@ GlmDflash::~GlmDflash() {
     for (cudaEvent_t e : d_->head_ev)
         if (e) cudaEventDestroy(e);
     if (d_->ds) cudaStreamDestroy(d_->ds);
+    // the head split's pinned rows and events (split_head; ev_c was made under the helper's device)
+    if (d_->hs.x_h) cudaFreeHost(d_->hs.x_h);
+    if (d_->hs.cand_h) cudaFreeHost(d_->hs.cand_h);
+    if (d_->hs.ev_x) cudaEventDestroy(d_->hs.ev_x);
+    if (d_->hs.ev_c) cudaEventDestroy(d_->hs.ev_c);
     cudaSetDevice(cur);
 }
 

@@ -40,6 +40,16 @@
 // bg_hold off.  A return: VramPool::map (all or nothing; Busy: the lease stays open, nothing changed) -> the slots
 // kFree under F.mu.
 //
+// THE WHOLE CARD (LEND <dev> ALL; GlmLender::whole_mib / lend_whole).  A card --lend-whole named, and the load's room
+// check passed (Glm5Model::lend_whole_check), has a footprint: whole_mib(dev) reports it and lend_whole(dev) destroys
+// its part and merges its layers into a neighbour part's (Glm5Model::lend_whole_plan / lend_whole_run, glm_resplit.cu:
+// the phases and what crosses are there).  The lender refuses - ok = false, max_mib the card's pool lendable - when the
+// card has no footprint now, or a POOL lease is open on the card or on the neighbour that would take its layers (the
+// lease holds the part's blocks: the part cannot go).  The handler already refuses a card with any lease open on it.
+// A whole-card lease's token is the lender's own, like a pool lease's; while it is open the card stays in lend_cards()
+// with nothing to lend (block 0), so LENDABLE lists it and a LEND on it answers ERR MAX 0.  Its RETURN is not here yet:
+// give_back on a whole-card token answers busy (the lease stays open) and says so once in the log.
+//
 // When to call: see make_glm_lender in glm_model.hpp - from the engine's command loop, with nothing in flight.
 #include "glm_fast_state.hpp"
 
@@ -570,7 +580,65 @@ public:
         return r;
     }
 
+    size_t whole_mib(int dev) override {
+        for (const Whole& w : whole_)
+            if (w.dev == dev) return 0;   // (its lease is open: the part is gone)
+        return (size_t) head_.whole_mib(dev);
+    }
+
+    LendResult lend_whole(int dev) override {
+        LendResult r;
+        int prev = 0;
+        cudaGetDevice(&prev);
+        // the refusal's figure: what the card's pool can lend now
+        for (const Card& k : cards())
+            if (k.dev == dev)
+                for (Glm5Model* m : k.parts) r.max_mib += (size_t) part_lendable(*m).blocks * (k.block >> 20);
+        Glm5Model::WholePlan plan;
+        std::string err;
+        if (!head_.lend_whole_plan(dev, plan, err)) {
+            std::fprintf(stderr, "glm lend: %s\n", err.c_str());
+            cudaSetDevice(prev);
+            return r;
+        }
+        // a pool lease on the card or on the neighbour holds blocks of a part that would go
+        for (const auto& [token, L] : leases_)
+            for (const auto& s : L.sets)
+                if (s.first == plan.lent || s.first == plan.into) {
+                    std::fprintf(stderr, "glm lend: CUDA%d is not lent whole while lease %llu holds %zu blocks of CUDA%d's "
+                                         "pool (layers [%d,%d))\n", dev, (unsigned long long) token, s.second.size(),
+                                 s.first->dev_, s.first->l0_, s.first->l1_);
+                    cudaSetDevice(prev);
+                    return r;
+                }
+        // its place in the card order, kept for the LENDABLE lines
+        int at = 0;
+        for (Glm5Model* m = &head_; m != nullptr && m != plan.lent; m = m->split_next_.get()) ++at;
+        if (!head_.lend_whole_run(plan, err)) {
+            std::fprintf(stderr, "glm lend: CUDA%d the whole-card lend failed: %s\n", dev, err.c_str());
+            cudaSetDevice(prev);
+            r.max_mib = 0;
+            for (const Card& k : cards())
+                if (k.dev == dev)
+                    for (Glm5Model* m : k.parts) r.max_mib += (size_t) part_lendable(*m).blocks * (k.block >> 20);
+            return r;
+        }
+        cudaSetDevice(prev);
+        const uint64_t token = next_++;
+        whole_.push_back({dev, at, (size_t) plan.mib, token});
+        r.ok = true;
+        r.mib = (size_t) plan.mib;
+        r.token = token;
+        return r;
+    }
+
     GiveBack give_back(int dev, uint64_t token) override {
+        for (const Whole& w : whole_)
+            if (w.token == token) {
+                std::fprintf(stderr, "glm lend: CUDA%d the return of a whole-card lease is not here yet: lease %llu stays "
+                                     "open\n", dev, (unsigned long long) token);
+                return GiveBack::busy;
+            }
         const auto it = leases_.find(token);
         if (it == leases_.end()) return GiveBack::returned;   // (never lent by this lender: nothing to put back)
         int prev = 0;
@@ -600,7 +668,14 @@ private:
         int dev = 0;
         std::vector<std::pair<Glm5Model*, std::vector<int>>> sets;   // part, its blocks
     };
+    struct Whole {   // a whole-card lease: the card's part is gone
+        int dev = 0;
+        int at = 0;       // where the card stood in the chain's card order (lend_cards keeps listing it there)
+        size_t mib = 0;   // the footprint released
+        uint64_t token = 0;
+    };
 
+    // the cards in the chain's order, a card lent whole kept at its place with nothing to lend
     std::vector<Card> cards() {
         std::vector<Card> out;
         for (Glm5Model* m = &head_; m != nullptr; m = m->split_next_.get()) {
@@ -615,6 +690,11 @@ private:
             const size_t b = m->fast_->vpool.block_bytes();
             if (k->block == 0) k->block = b;
             if (b == k->block) k->parts.push_back(m);
+        }
+        for (const Whole& w : whole_) {
+            bool listed = false;
+            for (const Card& x : out) listed = listed || x.dev == w.dev;
+            if (!listed) out.insert(out.begin() + std::min((size_t) w.at, out.size()), Card{w.dev, 0, {}});
         }
         return out;
     }
@@ -644,6 +724,7 @@ private:
 
     Glm5Model& head_;
     std::map<uint64_t, Lease> leases_;   // by token
+    std::vector<Whole> whole_;           // the whole-card leases open
     uint64_t next_ = 1;
 };
 

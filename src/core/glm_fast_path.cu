@@ -4031,7 +4031,7 @@ void Glm5Model::fast_destroy() {
     for (auto& R : F->rc)
         if (R.base && R.registered) numa_pinned_free(R.base, (size_t) R.n * R.stride);
         else
-            for (size_t i = 0; i < R.n_parts(); ++i) cudaFreeHost(R.part(i));
+            for (size_t i = 0; i < R.n_parts(); ++i) pin_free(R.part(i), R.part_slots(i) * R.stride);   // (pin_alloc's count)
     for (auto& d : F->draining) cudaEventDestroy(d.ev);
     for (auto& m : F->bg) cudaEventDestroy(m.ev);
     for (auto e : F->ev_free) cudaEventDestroy(e);

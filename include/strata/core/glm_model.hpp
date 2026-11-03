@@ -52,6 +52,8 @@ namespace glmfast {
 class Workers;
 }  // namespace glmfast
 
+struct ResplitPart;   // (below the class: a whole-card lend's room check figures)
+
 /// One served weight: F32 (dequantized at load) or a ggml-quantized row tensor uploaded RAW to
 /// VRAM and dotted by the device MMVQ.  type 0 = F32.
 struct WSlot {
@@ -224,6 +226,26 @@ public:
     void lend_whole_check(const std::vector<int>& devs);
     /// The whole-card footprint of card `dev` in MiB (the VramLender's whole_mib): 0 when it is not lent whole
     uint64_t whole_mib(int dev) const;
+    /// A whole-card lend's plan (src/core/glm_resplit.cu): the part on card `dev` and the neighbour part that takes
+    /// its layers, as resplit_room picks it on the split's figures NOW (the room may have changed since the load), and
+    /// the footprint the lend releases.  False + err: the card is not whole-lendable now (lend_whole_check did not
+    /// pass it, the room is gone, several conversations are set up).  Nothing changes.
+    struct WholePlan {
+        Glm5Model* lent = nullptr;   // the part on the card
+        Glm5Model* into = nullptr;   // the adjacent part that takes its layers
+        uint64_t mib = 0;            // the footprint released (whole_mib(dev))
+    };
+    bool lend_whole_plan(int dev, WholePlan& plan, std::string& err);
+    /// The lend itself, called on the head part with nothing in flight (make_glm_lender's calling rules): every part
+    /// quiesced (background moves held, copies landed, boundaries run, every stream synchronized), the conversation
+    /// state saved to RAM (slot_save: the snapshot and the DSA caches, every part), the lent part and the neighbour
+    /// destroyed (the later one first), the neighbour loaded again with the MERGED layer range on its own device (the
+    /// same pack, context, drafter and profile; its RAM tier the two tiers' sum), the chain re-linked and finished as
+    /// load_pack_split finishes it, the state loaded back (Glm5SlotLayout maps the sections onto the new split), and
+    /// the lent card's primary CUDA context released (cudaDeviceReset: the process leaves the card).  False + err
+    /// when the lend could not start - nothing changed.  Past the point of no return a failed reload rebuilds the two
+    /// parts as they were; should that fail too the engine ends with a message (its layers are gone).
+    bool lend_whole_run(const WholePlan& plan, std::string& err);
     /// Windows on an APU (AMD's Strix / Gorgon Halo): the bytes of experts the commit (RAM + page file) kept off the
     /// GPU over every part, and the page file (GiB) that keeps them on it - {0, 0} elsewhere (pool_check)
     std::pair<size_t, size_t> commit_capped() const;
@@ -1130,6 +1152,9 @@ public:
     bool dump_state(const std::string& path);
 
 private:
+    // the split's figures for a whole-card lend's room check (src/core/glm_resplit.cu): one ResplitPart per part of
+    // the chain from this one, and the parts themselves in the same order
+    void resplit_figures(std::vector<ResplitPart>& parts, std::vector<Glm5Model*>& chain);
     // scratch offsets, in floats into sc_
     int64_t sc_mixed = 0, sc_x = 0, sc_pre = 0, sc_post = 0, sc_comb = 0, sc_inv = 0, sc_proj = 0;
     int64_t sc_emb = 0;

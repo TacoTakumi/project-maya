@@ -708,6 +708,17 @@ Glm5Model::~Glm5Model() {
     if (dev_hit_out_) cudaFree(dev_hit_out_);
     if (bounce_) cudaFreeHost(bounce_);
     if (plan_host_) cudaFreeHost(plan_host_);
+    // the shards' views and descriptors (Linux keeps the views for the life of the part: the disk reads and the
+    // embedding rows go through them); a part destroyed and loaded again (a card lent whole) would leave them mapped
+#ifndef _WIN32
+    for (Shard& s : pack_shards_) {
+        if (s.base != nullptr) munmap(s.base, (size_t) s.size);
+        if (s.fd >= 0) close(s.fd);
+        if (s.fd_direct >= 0) close(s.fd_direct);
+        s.base = nullptr;
+        s.fd = s.fd_direct = -1;
+    }
+#endif
 }
 
 bool Glm5Model::load(const std::string& gguf_path, int64_t max_ctx, std::string& err) {
