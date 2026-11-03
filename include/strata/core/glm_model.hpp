@@ -227,8 +227,12 @@ public:
     /// --lend-whole: the room check of each card named (src/core/glm_resplit.cu, resplit_room below), once the split
     /// and the pools are known and before the engine reports ready.  A pass records the card's whole-card footprint
     /// (whole_mib(dev); the VRAM line's whole_mib= field), a fail or a device the split does not use prints one log
-    /// line with the reason and the card keeps pool lending only.  The load never fails for it.
+    /// line with the reason and the card keeps pool lending only.  The load never fails for it.  The list is kept
+    /// (lend_whole_devs()): a re-split reload - the rebuild after a failed lend, the return - loads two parts anew,
+    /// each a fresh model without its footprint, and runs the check again for those of the two the operator named.
     void lend_whole_check(const std::vector<int>& devs);
+    /// --lend-whole's list as lend_whole_check took it
+    const std::vector<int>& lend_whole_devs() const { return lend_whole_devs_; }
     /// The whole-card footprint of card `dev` in MiB (the VramLender's whole_mib): 0 when it is not lent whole
     uint64_t whole_mib(int dev) const;
     /// A whole-card lend's plan (src/core/glm_resplit.cu): the part on card `dev` and the neighbour part that takes
@@ -1152,6 +1156,7 @@ public:
     size_t commit_kept_ = 0, commit_limit_ = 0, commit_ram_ = 0;   // (a Windows APU: what the commit kept off, as read)
     PoolBudget pool_b_;                                    // the budget the pool was carved from
     uint64_t whole_mib_ = 0;                               // lend_whole_check's pass: this part's footprint (0: none)
+    std::vector<int> lend_whole_devs_;                     // --lend-whole's cards, as named (the head part's record)
     // a re-split reload (resplit_make): carve the expert pool as the part had it - this budget (PoolBudget::avail) in
     // place of the free-VRAM figure while it leaves half the VRAM reserve free, and this block size; 0: as at a load
     size_t pool_want_ = 0, pool_block_want_ = 0;
@@ -1203,6 +1208,7 @@ private:
     // the split's figures for a whole-card lend's room check (src/core/glm_resplit.cu): one ResplitPart per part of
     // the chain from this one, and the parts themselves in the same order
     void resplit_figures(std::vector<ResplitPart>& parts, std::vector<Glm5Model*>& chain);
+    void lend_whole_recheck(const std::vector<int>& devs);   // lend_whole_check's room check, the list kept as it is
     // the steps a whole-card re-split shares between the lend and the return (src/core/glm_resplit.cu): every part
     // of `chain` quiet with its background moves held (the caller lets go of bg_hold); one part loaded through
     // load_pack as load_pack_split loads one (nullptr + a log line when it did not); the chain finished as
@@ -1266,6 +1272,13 @@ struct ResplitRoom {
     std::string reason;      // why not (a fail)
 };
 ResplitRoom resplit_room(const std::vector<ResplitPart>& parts, int dev, uint64_t ram_avail, uint64_t ram_headroom);
+
+/// The cards a re-split reload checks again (src/core/glm_resplit.cu): of `reloaded`, the devices of the parts loaded
+/// anew (a rebuild after a failed lend or a return loads two: the lent card's part and the neighbour's, both fresh
+/// models without a footprint), those in `named`, --lend-whole's list, in the reloaded order, each once.  A device not
+/// named is left out: the check would announce a footprint the operator did not ask for.  Figures alone, so a test
+/// drives it (tests/glm_resplit_test).
+std::vector<int> resplit_recheck_devs(const std::vector<int>& reloaded, const std::vector<int>& named);
 
 /// The VramLender over a loaded model's expert pools (src/core/glm_lend.cu): every card of its parts, from the head
 /// part (the one load_pack returned; the later parts are its split_next_ chain).  A card lends whole blocks of its

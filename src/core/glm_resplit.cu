@@ -84,8 +84,11 @@
 //            part that did not load: the merged part is loaded again and finished, the state put back, the context
 //            released, busy (the lease stays open);
 //   link, restore  as the lend's, for the two fresh parts;
-//   check    lend_whole_check for the card: the room check as at the load, so the footprint is announced again
-//            (whole_mib(dev), LENDABLE whole=) and the card may be lent whole once more.
+//   check    the room check as at the load (lend_whole_recheck) for the two reloaded cards --lend-whole named - the lent
+//            card, and the neighbour when it is named too: both parts are fresh models without a footprint - so the
+//            footprint is announced again (whole_mib(dev), LENDABLE whole=) and each may be lent whole once more.  The
+//            rebuild after a failed lend runs the same check.  resplit_recheck_devs picks the cards: of the reloaded
+//            parts' devices, those lend_whole_check was given (it keeps the list), a card not named never checked.
 // The pools are carved from each card's free VRAM as at the load, so the parts come back with the layouts the load
 // gave them; their tiers warm again from the page cache as the decode routes.
 // The steps the two share - quiet, one part's load, the chain's finish - are resplit_quiet / resplit_make /
@@ -296,7 +299,22 @@ void Glm5Model::resplit_figures(std::vector<ResplitPart>& parts, std::vector<Glm
     }
 }
 
+std::vector<int> resplit_recheck_devs(const std::vector<int>& reloaded, const std::vector<int>& named) {
+    std::vector<int> out;
+    for (int dev : reloaded) {
+        if (std::find(named.begin(), named.end(), dev) == named.end()) continue;
+        if (std::find(out.begin(), out.end(), dev) != out.end()) continue;
+        out.push_back(dev);
+    }
+    return out;
+}
+
 void Glm5Model::lend_whole_check(const std::vector<int>& devs) {
+    lend_whole_devs_ = devs;   // (kept for the re-split reloads: they check the reloaded cards of this list again)
+    lend_whole_recheck(devs);
+}
+
+void Glm5Model::lend_whole_recheck(const std::vector<int>& devs) {
     if (devs.empty()) return;
     std::vector<ResplitPart> parts;
     std::vector<Glm5Model*> chain;
@@ -808,9 +826,10 @@ bool Glm5Model::lend_whole_run(const WholePlan& plan, std::string& err) {
             reset();
             for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->snap_pos_ = -1;
         }
-        // the load's room check again for the lent card, as the return runs it: the rebuilt part is a fresh model
-        // (whole_mib_ 0), and without the check the card would stay un-lendable whole until a restart
-        lend_whole_check({ldev});
+        // the load's room check again for the rebuilt cards the operator named, as the return runs it: both rebuilt
+        // parts are fresh models (whole_mib_ 0), and without the check the lent card - and a neighbour named too -
+        // would stay un-lendable whole until a restart
+        lend_whole_recheck(resplit_recheck_devs({plan.lo.dev, plan.hi.dev}, lend_whole_devs_));
         std::fprintf(stderr, "glm lend: CUDA%d rebuilt after the failed lend: whole-lendable %s; the split %s; %s\n", ldev,
                      whole_mib(ldev) > 0 ? "again" : "NOT (see above)", resplit_where().c_str() + 7,
                      restored ? resplit_state_words(st).c_str()
@@ -1036,9 +1055,11 @@ bool Glm5Model::lend_whole_return(const WholePlan& plan, std::string& err) {
     }
     const double t_restore = ms_since(t5);
 
-    // ---- check: the load's room check again for the card, so it may be lent whole again (whole_mib(dev) set anew)
+    // ---- check: the load's room check again for the returned cards the operator named - the lent card, and the
+    //      neighbour when it is named too (both parts are fresh models) - so each may be lent whole again (whole_mib(dev)
+    //      set anew)
     const auto t6 = clock::now();
-    lend_whole_check({ldev});
+    lend_whole_recheck(resplit_recheck_devs({plan.lo.dev, plan.hi.dev}, lend_whole_devs_));
     const double t_check = ms_since(t6);
 
     const Glm5Model* lp = plan.lo.dev == ldev ? ap : bp;
