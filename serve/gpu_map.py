@@ -13,8 +13,9 @@ BYTES = ("total", "free", "weights", "kv", "kv_ram", "act", "drafter", "window",
 
 
 def parse(line: str) -> dict | None:
-    """`VRAM dev=0 pci=0000:01:00.0 total=... layers=0-45` -> {"dev": 0, "pci": "0000:01:00", "addr": "0000:01:00.0",
-    ..., "layers": [0, 45]} (`addr`: pci_addr, the card the /vram routes name); None for a line that is not one."""
+    """`VRAM dev=0 pci=0000:01:00.0 total=... layers=0-45[ whole_mib=N]` -> {"dev": 0, "pci": "0000:01:00",
+    "addr": "0000:01:00.0", ..., "layers": [0, 45][, "whole_mib": N]} (`addr`: pci_addr, the card the /vram routes name;
+    `whole_mib` only when the line has the field); None for a line that is not one."""
     if not line.startswith("VRAM "):
         return None
     out: dict = {}
@@ -26,8 +27,14 @@ def parse(line: str) -> dict | None:
         elif k == "layers":
             a, _, b = v.partition("-")
             out["layers"] = [int(a), int(b)] if a.isdigit() and b.isdigit() else None
+        elif k == "whole_mib":
+            # the one field not in bytes: the footprint a whole-card lend of this GPU releases, MiB - on a card the
+            # engine was started with --lend-whole for and found room for; absent otherwise
+            out["whole_mib"] = int(v) if v.isdigit() and int(v) > 0 else None
         elif v.lstrip("-").isdigit():
             out[k] = int(v)
+    if out.get("whole_mib") is None:
+        out.pop("whole_mib", None)
     return out if "dev" in out else None
 
 
@@ -145,5 +152,6 @@ def view(report: list[dict], cards: list[dict] | None, engine_pid, vision_pid=No
                     "vision_own": inside,
                     "slots": r.get("slots", 0), "layers": r.get("layers"), "ctx": r.get("ctx", 0),
                     "tp_n": r.get("tp_n", 0),
-                    "kv_ram": r.get("kv_ram", 0), "measured": "nvml" if own is not None else "start"})
+                    "kv_ram": r.get("kv_ram", 0), "measured": "nvml" if own is not None else "start",
+                    **({"whole_mib": r["whole_mib"]} if r.get("whole_mib") else {})})
     return out

@@ -400,6 +400,27 @@ class GpuMap(unittest.TestCase):
         self.assertIsNone(self.gm.parse("INFO context=32768"))
         self.assertEqual(self.gm.pci_key("00000000:0A:00.0"), "0000:0a:00")
 
+    def test_whole_mib_field(self):
+        # the VRAM line of a card the engine may lend whole carries whole_mib=<MiB> (the footprint the lend releases,
+        # the one field not in bytes); a line without it has no such key, in parse and in view alike
+        self.assertNotIn("whole_mib", self.r)
+        r = self.gm.parse(LINE.rstrip("\n") + " whole_mib=13543\n")
+        self.assertEqual(r["whole_mib"], 13543)
+        self.assertEqual((r["dev"], r["pool"], r["layers"]), (self.r["dev"], self.r["pool"], self.r["layers"]))
+        (g,) = self.gm.view([r], [], engine_pid=100)
+        self.assertEqual(g["whole_mib"], 13543)
+        self.assertEqual(sum(g["parts"].values()) + g["free"], g["total"])
+        (h,) = self.gm.view([self.r], [], engine_pid=100)
+        self.assertNotIn("whole_mib", h)
+        # a field in the middle of the line, and a zero or malformed value, which means no footprint
+        m = self.gm.parse("VRAM dev=2 pci=0000:0f:00.0 total=16610951168 whole_mib=9000 free=301989888 layers=61-78")
+        self.assertEqual((m["whole_mib"], m["free"], m["layers"]), (9000, 301989888, [61, 78]))
+        self.assertNotIn("whole_mib", self.gm.parse("VRAM dev=2 total=1 free=1 whole_mib=0 layers=0-1"))
+        self.assertNotIn("whole_mib", self.gm.parse("VRAM dev=2 total=1 free=1 whole_mib=all layers=0-1"))
+        # two parts on one card merge as before, the field kept
+        (mg,) = self.gm.merge([r, dict(r, layers=[46, 60])])
+        self.assertEqual((mg["whole_mib"], mg["layers"]), (13543, [0, 60]))
+
     def test_helper_pool_is_accounted_separately_from_drafter_and_rest(self):
         helper = 20_000_000_000
         r = self.gm.parse(f"VRAM dev=2 pci=0000:0f:00.0 total={32 * GB} free={5 * GB} "

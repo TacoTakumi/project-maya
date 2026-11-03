@@ -316,6 +316,11 @@ struct Options {
     /// the later stages' devices "D1,D2,.." (default: the next visible GPUs; "0" with one K: both stages on this
     /// GPU, sharing everything - the bit-exact A/B of the hand-off)
     std::string split_device;
+    /// --lend-whole "D[,D..]": the cards (the engine's device numbers, the VRAM lines' dev=) that may be lent WHOLE -
+    /// their part destroyed so the card is free for another program, its layers taken in by a neighbour part.  Each is
+    /// checked for room at the load (Glm5Model::lend_whole_check); `lend_whole_devs` is the parsed list.
+    std::string lend_whole;
+    std::vector<int> lend_whole_devs;
     /// Plan v0.3 P8: stay resident and take requests on stdin (see the --serve block in main).
     bool serve = false;
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
@@ -380,6 +385,11 @@ void usage() {
                  "                       card's gives way to the pool's floor).  Env: MAYA_GLM_RESERVE_MB\n"
                  "  --vram-reserve-later-mib N  (--glm-pack) the same on a split's later GPUs (default: the above).\n"
                  "                       Env: MAYA_GLM_RESERVE_LATER_MB\n"
+                 "  --lend-whole D[,D..] (--glm-pack) the cards (the engine's device numbers, the VRAM lines' dev=)\n"
+                 "                       that may be lent whole to another program: at the load each is checked for\n"
+                 "                       room on a neighbour part (its dense weights, KV and pool floor in that pool,\n"
+                 "                       the merged RAM tier under the RAM headroom); a pass adds whole_mib= to the\n"
+                 "                       card's VRAM line, a card without room keeps pool lending only (one log line)\n"
                  "  --glm-ram-resident   the pinned RAM tier holds every expert VRAM does not, and nothing is evicted\n"
                  "                       to disk. The start fails if the tier cannot hold them (raise MAYA_GLM_RAM_GB\n"
                  "                       or lower --max-context). Env: MAYA_GLM_RAM_RESIDENT=1\n"
@@ -1093,6 +1103,9 @@ static int glm_pack_generate(const Options& o) {
         return 1;
     }
     const int64_t n_vocab = model.geometry().n_vocab;
+    // --lend-whole: the room check of each card named, now that the split and the pools are known (a pass puts
+    // whole_mib= on the card's VRAM line below; a fail logs one line and the card keeps pool lending only)
+    model.lend_whole_check(o.lend_whole_devs);
     // the driver samples on the device (sample_token), so the fast path never downloads the logits
     model.set_host_logits(false);
     if (model.fast()) {
@@ -1111,15 +1124,20 @@ static int glm_pack_generate(const Options& o) {
                     model.cpu_lane_threads_max(), model.pcie_share());
         // the Monitor's map of each GPU: what each part holds on its card, in bytes (Glm5Model::VramReport) - the
         // server finds the card NVML numbers by its PCI address and adds what NVML sees besides
-        for (const auto& r : model.vram_report())
+        // (whole_mib=<MiB>, the one field not in bytes, follows on a card --lend-whole named and the room check
+        // passed: the footprint a whole-card lend releases, serve/gpu_map.py's whole_mib)
+        for (const auto& r : model.vram_report()) {
             std::printf("VRAM dev=%d pci=%s total=%llu free=%llu weights=%llu kv=%llu kv_ram=%llu act=%llu drafter=%llu "
-                        "window=%llu pool=%llu tail=%llu borrow=%llu slots=%lld ctx=%lld layers=%d-%d\n",
+                        "window=%llu pool=%llu tail=%llu borrow=%llu slots=%lld ctx=%lld layers=%d-%d",
                         r.dev, r.pci.empty() ? "-" : r.pci.c_str(), (unsigned long long) r.total,
                         (unsigned long long) r.free, (unsigned long long) r.weights, (unsigned long long) r.kv,
                         (unsigned long long) r.kv_ram, (unsigned long long) r.act, (unsigned long long) r.drafter,
                         (unsigned long long) r.window, (unsigned long long) r.pool, (unsigned long long) r.tail,
                         (unsigned long long) r.borrow, (long long) r.slots,
                         (long long) r.ctx, r.l0, r.l1);
+            if (const uint64_t wm = model.whole_mib(r.dev); wm > 0) std::printf(" whole_mib=%llu", (unsigned long long) wm);
+            std::printf("\n");
+        }
         // (Windows on an APU: the commit - the page file - kept experts off the GPU; the server's log, Monitor and
         // /v1/status say so, as for DeepSeek's engine)
         if (const auto cc = model.commit_capped(); cc.first > 0) {
@@ -4756,6 +4774,7 @@ int main(int argc, char** argv) {
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
         else if (a == "--dflash") o.dflash = next("--dflash");
         else if (a == "--split-device") o.split_device = next("--split-device");
+        else if (a == "--lend-whole") o.lend_whole = next("--lend-whole");
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
@@ -4884,6 +4903,23 @@ int main(int argc, char** argv) {
         if (o.vram_reserve_given) set_env("STRATA_GLM_RESERVE_MB", std::to_string(o.vram_reserve_mib).c_str());
         if (o.vram_reserve_later_mib >= 0)
             set_env("STRATA_GLM_RESERVE_LATER_MB", std::to_string(o.vram_reserve_later_mib).c_str());
+        // --lend-whole D[,D..]: device numbers, refused here like the other options' malformed values
+        if (!o.lend_whole.empty()) {
+            const std::string& v = o.lend_whole;
+            bool ok = v.front() != ',' && v.back() != ',';
+            for (size_t a = 0, b; ok && a <= v.size(); a = b + 1) {
+                b = v.find(',', a);
+                if (b == std::string::npos) b = v.size();
+                const std::string t = v.substr(a, b - a);
+                ok = !t.empty() && t.size() <= 3 && t.find_first_not_of("0123456789") == std::string::npos;
+                if (ok) o.lend_whole_devs.push_back(std::atoi(t.c_str()));
+            }
+            if (!ok) {
+                std::fprintf(stderr, "maya generate: --lend-whole takes device numbers, comma-separated (not %s)\n",
+                             v.c_str());
+                return 2;
+            }
+        }
         if (o.pack != "pack/full") {
             std::fprintf(stderr, "maya generate: note: --glm-pack supersedes --pack (%s ignored)\n", o.pack.c_str());
         }

@@ -602,7 +602,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/glm_model.cu src/core/glm_fast_path.cu src/core/glm_prefill.cu src/core/glm_multi.cu src/core/glm_rows.cu
-    src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_mtp.cu src/core/glm_mtp_rows.cu src/core/glm_lend.cu)
+    src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_mtp.cu src/core/glm_mtp_rows.cu src/core/glm_lend.cu
+    src/core/glm_resplit.cu)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu strata_lend
                         ${_strata_gpu_runtime_target})
@@ -647,6 +648,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(glm_slot_test PRIVATE strata_engine ${_strata_gpu_runtime_target})
     add_test(NAME glm_slot_test COMMAND glm_slot_test)
     set_tests_properties(glm_slot_test PROPERTIES TIMEOUT 60)
+    # the room check of a whole-card lend (src/core/glm_resplit.cu, resplit_room) on made-up figures: the footprint,
+    # the neighbour choice, no room, a device outside the split, the RAM headroom - no model, no GPU
+    add_executable(glm_resplit_test tests/glm_resplit_test.cu)
+    target_include_directories(glm_resplit_test PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(glm_resplit_test PRIVATE strata_engine ${_strata_gpu_runtime_target})
+    add_test(NAME glm_resplit_test COMMAND glm_resplit_test)
+    set_tests_properties(glm_resplit_test PROPERTIES TIMEOUT 60)
   endif()
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/file_expert_source_test.cpp")
     enable_testing()

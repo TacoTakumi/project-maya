@@ -217,6 +217,13 @@ public:
         int64_t fixed = 0;
     };
     std::vector<PoolVram> pool_vram() const;
+    /// --lend-whole: the room check of each card named (src/core/glm_resplit.cu, resplit_room below), once the split
+    /// and the pools are known and before the engine reports ready.  A pass records the card's whole-card footprint
+    /// (whole_mib(dev); the VRAM line's whole_mib= field), a fail or a device the split does not use prints one log
+    /// line with the reason and the card keeps pool lending only.  The load never fails for it.
+    void lend_whole_check(const std::vector<int>& devs);
+    /// The whole-card footprint of card `dev` in MiB (the VramLender's whole_mib): 0 when it is not lent whole
+    uint64_t whole_mib(int dev) const;
     /// Windows on an APU (AMD's Strix / Gorgon Halo): the bytes of experts the commit (RAM + page file) kept off the
     /// GPU over every part, and the page file (GiB) that keeps them on it - {0, 0} elsewhere (pool_check)
     std::pair<size_t, size_t> commit_capped() const;
@@ -1077,6 +1084,7 @@ public:
     size_t pool_short_ = 0;                                // what that check found short of the reserve
     size_t commit_kept_ = 0, commit_limit_ = 0, commit_ram_ = 0;   // (a Windows APU: what the commit kept off, as read)
     PoolBudget pool_b_;                                    // the budget the pool was carved from
+    uint64_t whole_mib_ = 0;                               // lend_whole_check's pass: this part's footprint (0: none)
     static size_t mmq_scratch_reserve();      // ... of which the prompt path's MMQ scratch pool needs this much
     // the slots a layer must keep while the pool lends the prompt path: one route's experts, the device's spares, +2
     // (Strata's floor); STRATA_GLM_PREFILL_KEEP lowers it, never below route + spares
@@ -1138,6 +1146,36 @@ private:
 /// one layer's latent cache (0: not streamed).
 size_t glm_prefill_lend_bytes(const Glm5Geometry& g, size_t T, bool has_kda, bool has_dsa, bool has_dense,
                               bool has_moe, bool mtp, int64_t max_ctx, size_t gstride, size_t kv_stage = 0);
+
+/// The room check of a whole-card lend (src/core/glm_resplit.cu), on figures alone - no model, no GPU behind it, so
+/// a test drives it with made-up bytes (tests/glm_resplit_test).  One ResplitPart per part of the split, in chain
+/// order: its device, its layers, what it holds on the card (the VRAM line's figures: dense weights, the sequence
+/// state, activations, a drafter, the verify window, the expert pool as mapped), its pool's floor (pool_keep slots a
+/// layer, in the pool bytes they take) and its pinned RAM tier.  resplit_room(parts, dev, ram_avail, ram_headroom):
+/// the card `dev` may be lent whole when an ADJACENT part - the previous or the next in the chain, the one with the
+/// most pool room above its own floor, the previous on a tie - has room there for the card's dense weights + KV +
+/// pool floor (its layers move into that pool), AND the merged RAM tier - the neighbour's as pinned plus the lent
+/// part's, which the neighbour pins anew before the lent part's own is released - stays within the neighbour's tier
+/// plus what the host can pin now under the headroom (ram_avail: MemAvailable now, as the tier sizing reads it, 0 =
+/// unknown and the RAM rule is skipped; ram_headroom: STRATA_GLM_RAM_HEADROOM_GB, the figure the tier sizing keeps
+/// free).  A pass gives the neighbour's index and the footprint: everything the part holds on its card, in whole MiB
+/// rounded up (the CUDA context is not counted: the card's total - free also holds other programs' memory).  A fail
+/// gives a reason, "not in the split" for a device no part runs on; a device two parts share and a lone part refuse.
+struct ResplitPart {
+    int dev = 0;
+    int l0 = 0, l1 = 0;
+    uint64_t weights = 0, kv = 0, act = 0, drafter = 0, window = 0;
+    uint64_t pool = 0;       // the expert pool's bytes on the card (the main slots as mapped, and the tail)
+    uint64_t floor = 0;      // what a lend leaves the pool: pool_keep slots a layer, in pool bytes
+    uint64_t ram = 0;        // the pinned RAM tier
+};
+struct ResplitRoom {
+    bool ok = false;
+    int into = -1;           // the part (an index into parts) that takes the card's layers
+    uint64_t whole_mib = 0;  // the card's whole-card footprint (a pass)
+    std::string reason;      // why not (a fail)
+};
+ResplitRoom resplit_room(const std::vector<ResplitPart>& parts, int dev, uint64_t ram_avail, uint64_t ram_headroom);
 
 /// The VramLender over a loaded model's expert pools (src/core/glm_lend.cu): every card of its parts, from the head
 /// part (the one load_pack returned; the later parts are its split_next_ chain).  A card lends whole blocks of its
