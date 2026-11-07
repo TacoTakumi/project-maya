@@ -3407,6 +3407,8 @@ class EngineEndTests(unittest.TestCase):
                                  poll=lambda: None)
         e.lines, e.multi, e.ended = queue.Queue(), 0, False
         e._routes, e._routes_lock = {}, threading.Lock()
+        from serve import vram_lend
+        e._lend_calls = vram_lend.Calls(io.StringIO())   # (start() makes it: the lend commands' answers)
         e._pump()
         got = []
         while (line := e.lines.get_nowait()) is not None:
