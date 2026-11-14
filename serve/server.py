@@ -1248,7 +1248,8 @@ class StrataEngine:
         # the engine again, about a minute each)
         proc = proc if proc is not None else self.proc
         lines = lines if lines is not None else self.lines
-        lend_calls = lend_calls if lend_calls is not None else self._lend_calls
+        if lend_calls is None:                          # (a replaced process's are its own, never the running one's)
+            lend_calls = self._lend_calls if proc is self.proc else None
         for line in proc.stdout:
             if proc is not self.proc:                   # replaced: what is left of its output is nobody's
                 continue
@@ -1271,7 +1272,8 @@ class StrataEngine:
                 continue
             lines.put(line)
         if proc is not self.proc:                       # an engine already replaced: the running one is not ended
-            lend_calls.close()                          # (its lend commands still out: nobody answers them now)
+            if lend_calls is not None:
+                lend_calls.close()                      # (its lend commands still out: nobody answers them now)
             return
         self.ended = True                               # its output closed: it is gone, even before the OS says so
         lines.put(None)
