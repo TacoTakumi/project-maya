@@ -483,12 +483,12 @@ class ThinkingBudget(_Glm53Api):
 # ---------------------------------------------------------------------------------------------- the Monitor's figures
 # The keys the engine printed on GLM-5.3 (glm-dsa) in a real run (2026-11-07; the values left out) - the very lines
 # GLM-5.3-Flash's engine prints (src/program/generate.cpp: the glm-fast serve start, its decode loop's STAT every 8
-# tokens, the 10-field DONE)
+# tokens, the 10-field DONE).  vram-lend: no vision_lend / vision fields - the encoder borrows a lease instead
 REAL_INFO = ("context kv kv_resident expert_slots expert_cache_mib engine_kind experts vram_slots vram_gb ram_slots "
-             "ram_gb mtp dflash vision_lend cpu_threads cpu_threads_max pcie_share logit_bias").split()
+             "ram_gb mtp dflash cpu_threads cpu_threads_max pcie_share logit_bias").split()
 REAL_STAT = ("tok_s ms_tok vram_hit ram_fetch disk promo vram_used vram_slots ram_used ram_slots ram_gb vram_gb disk_gb "
              "draft_acc draft_off").split()
-REAL_VRAM = "dev pci total free weights kv kv_ram act drafter window pool tail borrow vision slots ctx layers".split()
+REAL_VRAM = "dev pci total free weights kv kv_ram act drafter window pool tail borrow slots ctx layers".split()
 # what monitor.js reads from INFO that GLM's engine does not print: DeepSeek's (its n-gram memory, its helper GPU) and
 # the Windows-APU line (INFO gpu_commit_capped_gb / pagefile_hint_gb: printed beside the first only when the page file
 # keeps experts off the GPU) - and the server's own max_context
