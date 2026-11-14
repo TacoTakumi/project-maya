@@ -237,7 +237,7 @@ namespace {
 // the headroom the RAM tier was sized against (fast_setup's head_gb)
 uint64_t ram_headroom_bytes(const Glm5Model::FastState* F) {
     double head_gb = F != nullptr && F->unified_memory ? 16.0 : 6.0;
-    if (const char* h = getenv("STRATA_GLM_RAM_HEADROOM_GB")) head_gb = std::max(0.0, std::atof(h));
+    if (const char* h = getenv("MAYA_GLM_RAM_HEADROOM_GB")) head_gb = std::max(0.0, std::atof(h));
     return (uint64_t) (head_gb * 1073741824.0);
 }
 
