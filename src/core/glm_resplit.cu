@@ -329,6 +329,13 @@ void Glm5Model::lend_whole_recheck(const std::vector<int>& devs) {
             std::fprintf(stderr, "glm lend: CUDA%d is not lent whole: no expert pool (the slow path)\n", dev);
             continue;
         }
+        // refusal ablation (--ablate, upstream v1.1.59) puts the direction on each part at the start only: a part the
+        // re-split builds again would have none and project nothing while the head still says it ablates
+        if (ablate_loaded()) {
+            std::fprintf(stderr, "glm lend: CUDA%d is not lent whole: --ablate is on (a re-split part would lose the "
+                                 "refusal direction); pool lending only\n", dev);
+            continue;
+        }
         const ResplitRoom r = resplit_room(parts, dev, avail, head_b);
         const std::string why = r.ok ? lend_rules(parts, dev, r) : r.reason;
         if (!why.empty()) {
