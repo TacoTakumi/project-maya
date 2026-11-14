@@ -790,7 +790,7 @@ int Glm5Model::dsa_n_sel_last() const {
 bool Glm5Model::prefill_tokens_dsa(const std::vector<int32_t>& tokens, int32_t next_token, std::string& err) {
     bool batched = true;   // prefill()'s batched path can run on every part
     for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
-        batched = batched && m->pf_ != nullptr && m->fast_ != nullptr && !m->vis_lent_;
+        batched = batched && m->pf_ != nullptr && m->fast_ != nullptr;   // (vram-lend: no vis_lent_, the encoder borrows a lease)
     if (!glmpfs::mtp_token_fill(g_.arch == GlmArch::GlmDsa, fast_ != nullptr && has_mtp(), batched,
                                 (int64_t) tokens.size(), glmpfs::prefill_min_tokens(getenv("MAYA_GLM_PREFILL_MIN"))))
         return false;   // Maya's prefill(): the batched path (mtp_fill) or the generic token path
